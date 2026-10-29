@@ -49,7 +49,11 @@ class Program
     private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
     private static readonly string DataFilePath = Path.Combine(AppContext.BaseDirectory, "bot-data.json");
     private static readonly string UpdateFilePath = Path.Combine(AppContext.BaseDirectory, "bot-update.json");
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true
+    };
     private static readonly object DataLock = new();
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
     private static readonly string AlertsUrl = Environment.GetEnvironmentVariable("ALERTS_API_URL") ?? DefaultAlertsUrl;
