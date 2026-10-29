@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.Json;
 using Telegram.Bot;
 using Telegram.Bot.Polling;
@@ -46,6 +47,10 @@ class Program
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
+    private static readonly string DataFilePath = Path.Combine(AppContext.BaseDirectory, "bot-data.json");
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly object DataLock = new();
+    private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
     private static readonly string AlertsUrl = Environment.GetEnvironmentVariable("ALERTS_API_URL") ?? DefaultAlertsUrl;
     private static TelegramBotClient Bot = null!;
 
@@ -60,6 +65,7 @@ class Program
             return;
         }
 
+        LoadSubscriptions();
         Bot = new TelegramBotClient(token);
         User me = await Bot.GetMe();
         Console.WriteLine($"Бот @{me.Username} запущен.");
@@ -77,6 +83,39 @@ class Program
         Task alerts = AlertPollingLoopAsync(cts.Token);
 
         await Task.WhenAll(polling, alerts);
+    }
+
+    private static void LoadSubscriptions()
+    {
+        if (!File.Exists(DataFilePath))
+        {
+            return;
+        }
+
+        try
+        {
+            string json = File.ReadAllText(DataFilePath);
+            List<PersistedSubscription>? saved = JsonSerializer.Deserialize<List<PersistedSubscription>>(json);
+
+            if (saved is null)
+            {
+                return;
+            }
+
+            foreach (PersistedSubscription item in saved)
+            {
+                if (!string.IsNullOrWhiteSpace(item.Region) && !string.IsNullOrWhiteSpace(item.City))
+                {
+                    Subscriptions[item.ChatId] = new Subscription(item.Region, item.City, item.District ?? "Район не вказано");
+                }
+            }
+
+            Console.WriteLine($"Завантажено підписок: {Subscriptions.Count}.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не вдалося завантажити bot-data.json: {ex.Message}");
+        }
     }
 
     private static async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
@@ -122,6 +161,9 @@ class Program
             {
                 Subscriptions.Remove(chatId, out _);
                 PendingRegions.Remove(chatId);
+                PendingDistricts.Remove(chatId);
+                AwaitingDistrictText.Remove(chatId);
+                SaveSubscriptions();
                 await bot.SendMessage(chatId, "Підписку вимкнено. Щоб підписатися знову — /start", cancellationToken: ct);
             }
             else if (AwaitingDistrictText.Remove(chatId))
@@ -137,6 +179,7 @@ class Program
                 Subscriptions[chatId] = new Subscription(region, city, district);
                 PendingRegions.Remove(chatId);
                 PendingDistricts.Remove(chatId);
+                SaveSubscriptions();
                 await bot.SendMessage(chatId,
                     $"Готово. Ти підписаний на {city}, {district}, {region}.\n\n" +
                     "Я повідомлю про зміну статусу повітряної тривоги. Перевіряй також офіційні джерела.",
@@ -152,10 +195,11 @@ class Program
                 }
                 else
                 {
-                    PendingDistricts[chatId] = "Район не вказано";
                     await bot.SendMessage(chatId, "Напиши назву свого району одним повідомленням:", cancellationToken: ct);
+                    AwaitingDistrictText.Add(chatId);
                 }
             }
+
             else
             {
                 await bot.SendMessage(chatId, "Напиши /start для вибору області або /help для списку команд.", cancellationToken: ct);
@@ -164,6 +208,31 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"Ошибка обработки обновления: {ex.Message}");
+        }
+    }
+
+    private static void SaveSubscriptions()
+    {
+        try
+        {
+            lock (DataLock)
+            {
+                List<PersistedSubscription> saved = Subscriptions
+                    .Select(item => new PersistedSubscription(
+                        item.Key,
+                        item.Value.Region,
+                        item.Value.City,
+                        item.Value.District))
+                    .ToList();
+
+                string temporaryPath = DataFilePath + ".tmp";
+                File.WriteAllText(temporaryPath, JsonSerializer.Serialize(saved, JsonOptions));
+                File.Move(temporaryPath, DataFilePath, true);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не вдалося зберегти bot-data.json: {ex.Message}");
         }
     }
 
@@ -185,8 +254,8 @@ class Program
             }
             else
             {
-                PendingDistricts[chatId] = "Район не вказано";
                 await Bot.SendMessage(chatId, $"Обрана область: {region}. Напиши назву свого району:", cancellationToken: ct);
+                AwaitingDistrictText.Add(chatId);
             }
         }
         else if (data.StartsWith("district:", StringComparison.Ordinal))
@@ -206,6 +275,7 @@ class Program
             Subscriptions[chatId] = new Subscription(region, city, district);
             PendingRegions.Remove(chatId);
             PendingDistricts.Remove(chatId);
+            SaveSubscriptions();
             await Bot.SendMessage(chatId,
                 $"Готово. Ти підписаний на {city}, {district}, {region}.\n\n" +
                 "Я повідомлю про зміну статусу повітряної тривоги. Перевіряй також офіційні джерела.",
@@ -449,12 +519,37 @@ class Program
 
     private static string FormatTime(string value)
     {
-        if (DateTime.TryParse(value, out DateTime date) && date.Year <= 1971)
+        if (string.IsNullOrWhiteSpace(value))
         {
-            return "невідомий (джерело не передало актуальний час)";
+            return "невідомий (джерело не передало час)";
         }
 
-        return string.IsNullOrWhiteSpace(value) ? "невідомий" : value;
+        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime date))
+        {
+            if (date.Year <= 1971)
+            {
+                return "невідомий (джерело передало технічну дату)";
+            }
+
+            DateTime kyivTime = DateTime.SpecifyKind(date, DateTimeKind.Unspecified);
+            TimeSpan offset = KyivTimeZone.GetUtcOffset(kyivTime);
+            DateTimeOffset exactKyivTime = new(kyivTime, offset);
+            return $"{exactKyivTime:dd.MM.yyyy HH:mm:ss} (Київ)";
+        }
+
+        return value;
+    }
+
+    private static TimeZoneInfo GetKyivTimeZone()
+    {
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById("FLE Standard Time");
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById("Europe/Kyiv");
+        }
     }
 
     private static Task HandleErrorAsync(ITelegramBotClient _, Exception exception, CancellationToken __)
@@ -464,5 +559,6 @@ class Program
     }
 
     private sealed record Subscription(string Region, string City, string District);
+    private sealed record PersistedSubscription(long ChatId, string Region, string City, string? District);
     private sealed record AlertState(bool IsAlert, string UpdatedAt, string? Threat = null, bool HasData = true);
 }
