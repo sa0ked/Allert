@@ -118,7 +118,7 @@ class Program
         }
     }
 
-    private static async Task SendBotUpdateAsync(CancellationToken ct)
+    private static async Task SendBotUpdateAsync(CancellationToken ct, long? onlyChatId = null)
     {
         BotUpdate? update = LoadBotUpdate();
         if (update is null)
@@ -136,7 +136,11 @@ class Program
                       $"Дата: {FormatTime(update.UpdatedAt)}\n\n" +
                       changes;
 
-        foreach (long chatId in Subscriptions.Keys.ToArray())
+        IEnumerable<long> recipients = onlyChatId.HasValue
+            ? new[] { onlyChatId.Value }
+            : Subscriptions.Keys.ToArray();
+
+        foreach (long chatId in recipients)
         {
             try
             {
@@ -222,6 +226,7 @@ class Program
             if (text.Equals("/start", StringComparison.OrdinalIgnoreCase))
             {
                 await SendRegionsAsync(chatId, ct);
+                await SendBotUpdateAsync(ct, chatId);
             }
             else if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
@@ -234,6 +239,10 @@ class Program
             else if (text.Equals("/alarm", StringComparison.OrdinalIgnoreCase) || text.Equals("Є тривога?", StringComparison.OrdinalIgnoreCase))
             {
                 await SendAlarmStatusAsync(chatId, ct);
+            }
+            else if (text.Equals("/updates", StringComparison.OrdinalIgnoreCase))
+            {
+                await SendBotUpdateAsync(ct, chatId);
             }
             else if (text.Equals("/stop", StringComparison.OrdinalIgnoreCase))
             {
@@ -400,7 +409,7 @@ class Program
     }
 
     private static Task SendHelpAsync(long chatId, CancellationToken ct) => Bot.SendMessage(chatId,
-        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/stop — вимкнути сповіщення\n/help — допомога\n\n" +
+        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/updates — останні оновлення\n/stop — вимкнути сповіщення\n/help — допомога\n\n" +
         "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.", cancellationToken: ct);
 
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
@@ -512,7 +521,8 @@ class Program
             }
 
             string updatedAt = ReadString(item, "last_update", "updated_at", "updatedAt", "started_at");
-            return new AlertState(true, updatedAt);
+            string level = ReadString(item, "level", "alert_level", "color");
+            return new AlertState(true, updatedAt, level);
         }
 
         return new AlertState(false, "", HasData: false);
@@ -551,7 +561,7 @@ class Program
         }
 
         return state.IsAlert
-            ? $"🚨 ТРИВОГА\nЧЕРВОНИЙ РІВЕНЬ НЕБЕЗПЕКИ\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nНегайно пройди до укриття та стеж за офіційними повідомленнями."
+            ? $"🚨 ТРИВОГА\n{FormatAlertLevel(state.Level)}\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nНегайно пройди до укриття та стеж за офіційними повідомленнями."
             : $"✅ Відбій повітряної тривоги\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nВсе одно перевіряй офіційні джерела.";
     }
 
@@ -563,8 +573,25 @@ class Program
         }
 
         return state.IsAlert
-            ? $"🚨 Так, є повітряна тривога!\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nПройди до укриття та стеж за офіційними повідомленнями."
+            ? $"🚨 Так, є повітряна тривога!\n{FormatAlertLevel(state.Level)}\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nПройди до укриття та стеж за офіційними повідомленнями."
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nІнформація може змінитися — перевіряй офіційні джерела.";
+    }
+
+    private static string FormatAlertLevel(string level)
+    {
+        if (level.Contains("жовт", StringComparison.OrdinalIgnoreCase) ||
+            level.Contains("yellow", StringComparison.OrdinalIgnoreCase))
+        {
+            return "🟡 ЖОВТИЙ РІВЕНЬ НЕБЕЗПЕКИ";
+        }
+
+        if (level.Contains("червон", StringComparison.OrdinalIgnoreCase) ||
+            level.Contains("red", StringComparison.OrdinalIgnoreCase))
+        {
+            return "🔴 ЧЕРВОНИЙ РІВЕНЬ НЕБЕЗПЕКИ";
+        }
+
+        return "⚠️ РІВЕНЬ НЕ ВКАЗАНО ДЖЕРЕЛОМ";
     }
 
     private static string FormatTime(string value)
@@ -611,5 +638,5 @@ class Program
     private sealed record Subscription(string Region, string City, string District);
     private sealed record PersistedSubscription(long ChatId, string Region, string City, string? District);
     private sealed record BotUpdate(string Version, string UpdatedAt, string Title, List<string>? Changes);
-    private sealed record AlertState(bool IsAlert, string UpdatedAt, bool HasData = true);
+    private sealed record AlertState(bool IsAlert, string UpdatedAt, string Level = "", bool HasData = true);
 }
