@@ -166,7 +166,7 @@ class Program
 
         try
         {
-            return JsonSerializer.Deserialize<BotUpdate>(File.ReadAllText(UpdateFilePath));
+            return JsonSerializer.Deserialize<BotUpdate>(File.ReadAllText(UpdateFilePath), JsonOptions);
         }
         catch (Exception ex)
         {
