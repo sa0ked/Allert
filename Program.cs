@@ -52,8 +52,7 @@ class Program
     static async Task Main()
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        Console.Write("");
-        string? token = Console.ReadLine()?.Trim();
+        string? token = Environment.GetEnvironmentVariable("9237538471:AAF7wL7yzUaCfRj19YuaA6n0fYy4Gqb-6wQ")?.Trim();
 
         if (string.IsNullOrWhiteSpace(token))
         {
