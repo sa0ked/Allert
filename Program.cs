@@ -126,9 +126,10 @@ class Program
             return;
         }
 
-        string changes = update.Changes.Count == 0
+        List<string> updateChanges = update.Changes ?? new List<string>();
+        string changes = updateChanges.Count == 0
             ? "Змін немає."
-            : string.Join("\n", update.Changes.Select(change => $"• {change}"));
+            : string.Join("\n", updateChanges.Select(change => $"• {change}"));
 
         string text = $"📢 {update.Title}\n" +
                       $"Версія: {update.Version}\n" +
@@ -609,6 +610,6 @@ class Program
 
     private sealed record Subscription(string Region, string City, string District);
     private sealed record PersistedSubscription(long ChatId, string Region, string City, string? District);
-    private sealed record BotUpdate(string Version, string UpdatedAt, string Title, List<string> Changes);
+    private sealed record BotUpdate(string Version, string UpdatedAt, string Title, List<string>? Changes);
     private sealed record AlertState(bool IsAlert, string UpdatedAt, bool HasData = true);
 }
