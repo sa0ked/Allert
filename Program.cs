@@ -48,6 +48,7 @@ class Program
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
     private static readonly string DataFilePath = Path.Combine(AppContext.BaseDirectory, "bot-data.json");
+    private static readonly string UpdateFilePath = Path.Combine(AppContext.BaseDirectory, "bot-update.json");
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly object DataLock = new();
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
@@ -71,6 +72,8 @@ class Program
         Console.WriteLine($"Бот @{me.Username} запущен.");
         Console.WriteLine($"Источник статусов: {AlertsUrl}");
 
+        await SendBotUpdateAsync(ct: CancellationToken.None);
+
         using CancellationTokenSource cts = new();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -82,7 +85,85 @@ class Program
         Task polling = Bot.ReceiveAsync(HandleUpdateAsync, HandleErrorAsync, options, cts.Token);
         Task alerts = AlertPollingLoopAsync(cts.Token);
 
-        await Task.WhenAll(polling, alerts);
+        try
+        {
+            await Task.WhenAll(polling, alerts);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            await SendMaintenanceMessageAsync();
+        }
+    }
+
+    private static async Task SendMaintenanceMessageAsync()
+    {
+        const string text =
+            "🔧 Бот тимчасово вимикається на технічні роботи.\n" +
+            "Сповіщення будуть недоступні до завершення оновлення.\n\n" +
+            "Будь ласка, перевіряй офіційні джерела цивільного захисту.";
+
+        foreach (long chatId in Subscriptions.Keys.ToArray())
+        {
+            try
+            {
+                await Bot.SendMessage(chatId, text);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не вдалося надіслати повідомлення про технічні роботи в чат {chatId}: {ex.Message}");
+            }
+        }
+    }
+
+    private static async Task SendBotUpdateAsync(CancellationToken ct)
+    {
+        BotUpdate? update = LoadBotUpdate();
+        if (update is null)
+        {
+            return;
+        }
+
+        string changes = update.Changes.Count == 0
+            ? "Змін немає."
+            : string.Join("\n", update.Changes.Select(change => $"• {change}"));
+
+        string text = $"📢 {update.Title}\n" +
+                      $"Версія: {update.Version}\n" +
+                      $"Дата: {FormatTime(update.UpdatedAt)}\n\n" +
+                      changes;
+
+        foreach (long chatId in Subscriptions.Keys.ToArray())
+        {
+            try
+            {
+                await Bot.SendMessage(chatId, text, cancellationToken: ct);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не вдалося надіслати оновлення в чат {chatId}: {ex.Message}");
+            }
+        }
+    }
+
+    private static BotUpdate? LoadBotUpdate()
+    {
+        if (!File.Exists(UpdateFilePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<BotUpdate>(File.ReadAllText(UpdateFilePath));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не вдалося завантажити bot-update.json: {ex.Message}");
+            return null;
+        }
     }
 
     private static void LoadSubscriptions()
@@ -152,10 +233,6 @@ class Program
             else if (text.Equals("/alarm", StringComparison.OrdinalIgnoreCase) || text.Equals("Є тривога?", StringComparison.OrdinalIgnoreCase))
             {
                 await SendAlarmStatusAsync(chatId, ct);
-            }
-            else if (text.Equals("/threat", StringComparison.OrdinalIgnoreCase) || text.Equals("Є загроза?", StringComparison.OrdinalIgnoreCase))
-            {
-                await SendThreatStatusAsync(chatId, ct);
             }
             else if (text.Equals("/stop", StringComparison.OrdinalIgnoreCase))
             {
@@ -322,12 +399,12 @@ class Program
     }
 
     private static Task SendHelpAsync(long chatId, CancellationToken ct) => Bot.SendMessage(chatId,
-        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/threat — є загроза?\n/stop — вимкнути сповіщення\n/help — допомога\n\n" +
+        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/stop — вимкнути сповіщення\n/help — допомога\n\n" +
         "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.", cancellationToken: ct);
 
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
     {
-        new KeyboardButton[] { "Є тривога?", "Є загроза?" },
+        new KeyboardButton[] { "Є тривога?" },
         new KeyboardButton[] { "/status", "/stop" }
     })
     {
@@ -345,18 +422,6 @@ class Program
 
         AlertState state = await GetAlertStateAsync(subscription.Region, ct);
         await Bot.SendMessage(chatId, FormatAlarmStatus(state, subscription.Region), replyMarkup: GetStatusKeyboard(), cancellationToken: ct);
-    }
-
-    private static async Task SendThreatStatusAsync(long chatId, CancellationToken ct)
-    {
-        if (!Subscriptions.TryGetValue(chatId, out Subscription? subscription))
-        {
-            await Bot.SendMessage(chatId, "Спочатку обери область командою /start.", cancellationToken: ct);
-            return;
-        }
-
-        AlertState state = await GetAlertStateAsync(subscription.Region, ct);
-        await Bot.SendMessage(chatId, FormatThreatStatus(state, subscription.Region), replyMarkup: GetStatusKeyboard(), cancellationToken: ct);
     }
 
     private static async Task SendStatusAsync(long chatId, CancellationToken ct)
@@ -446,8 +511,7 @@ class Program
             }
 
             string updatedAt = ReadString(item, "last_update", "updated_at", "updatedAt", "started_at");
-            string threat = ReadString(item, "alert_type", "threat", "type");
-            return new AlertState(true, updatedAt, threat);
+            return new AlertState(true, updatedAt);
         }
 
         return new AlertState(false, "", HasData: false);
@@ -502,21 +566,6 @@ class Program
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nІнформація може змінитися — перевіряй офіційні джерела.";
     }
 
-    private static string FormatThreatStatus(AlertState state, string region)
-    {
-        if (!state.HasData)
-        {
-            return $"⚠️ Немає актуальних даних про загрозу.\nРегіон: {region}\n\nПеревір офіційні джерела цивільного захисту.";
-        }
-
-        if (!string.IsNullOrWhiteSpace(state.Threat))
-        {
-            return $"⚠️ Є офіційне попередження про загрозу.\nРегіон: {region}\nТип: {state.Threat}\nЧас: {FormatTime(state.UpdatedAt)}\n\nДій за вказівками цивільного захисту.";
-        }
-
-        return $"✅ Окремого офіційного попередження про загрозу не зафіксовано.\nРегіон: {region}\nЧас: {FormatTime(state.UpdatedAt)}\n\nЦе не гарантує відсутність небезпеки — стеж за офіційними джерелами.";
-    }
-
     private static string FormatTime(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -560,5 +609,6 @@ class Program
 
     private sealed record Subscription(string Region, string City, string District);
     private sealed record PersistedSubscription(long ChatId, string Region, string City, string? District);
-    private sealed record AlertState(bool IsAlert, string UpdatedAt, string? Threat = null, bool HasData = true);
+    private sealed record BotUpdate(string Version, string UpdatedAt, string Title, List<string> Changes);
+    private sealed record AlertState(bool IsAlert, string UpdatedAt, bool HasData = true);
 }
