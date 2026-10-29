@@ -47,8 +47,10 @@ class Program
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
+    private const string AdminUsername = "sa0ked";
     private static readonly string DataFilePath = Path.Combine(AppContext.BaseDirectory, "bot-data.json");
     private static readonly string UpdateFilePath = Path.Combine(AppContext.BaseDirectory, "bot-update.json");
+    private static readonly string UpdateVersionPath = Path.Combine(AppContext.BaseDirectory, "bot-update-version.txt");
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -57,6 +59,7 @@ class Program
     private static readonly object DataLock = new();
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
     private static readonly string AlertsUrl = Environment.GetEnvironmentVariable("ALERTS_API_URL") ?? DefaultAlertsUrl;
+    private static readonly string? UpdatesUrl = Environment.GetEnvironmentVariable("UPDATES_URL");
     private static TelegramBotClient Bot = null!;
 
     static async Task Main()
@@ -76,8 +79,6 @@ class Program
         Console.WriteLine($"Бот @{me.Username} запущен.");
         Console.WriteLine($"Источник статусов: {AlertsUrl}");
 
-        await SendBotUpdateAsync(ct: CancellationToken.None);
-
         using CancellationTokenSource cts = new();
         Console.CancelKeyPress += (_, e) =>
         {
@@ -88,10 +89,11 @@ class Program
         ReceiverOptions options = new() { AllowedUpdates = Array.Empty<UpdateType>() };
         Task polling = Bot.ReceiveAsync(HandleUpdateAsync, HandleErrorAsync, options, cts.Token);
         Task alerts = AlertPollingLoopAsync(cts.Token);
+        Task updates = UpdatePollingLoopAsync(cts.Token);
 
         try
         {
-            await Task.WhenAll(polling, alerts);
+            await Task.WhenAll(polling, alerts, updates);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -102,12 +104,18 @@ class Program
         }
     }
 
-    private static async Task SendMaintenanceMessageAsync()
+    private static bool IsAdmin(Message message)
     {
-        const string text =
+        return string.Equals(message.From?.Username, AdminUsername, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task SendMaintenanceMessageAsync(string? customText = null)
+    {
+        const string defaultText =
             "🔧 Бот тимчасово вимикається на технічні роботи.\n" +
             "Сповіщення будуть недоступні до завершення оновлення.\n\n" +
             "Будь ласка, перевіряй офіційні джерела цивільного захисту.";
+        string text = string.IsNullOrWhiteSpace(customText) ? defaultText : $"🔧 {customText}";
 
         foreach (long chatId in Subscriptions.Keys.ToArray())
         {
@@ -124,7 +132,7 @@ class Program
 
     private static async Task SendBotUpdateAsync(CancellationToken ct, long? onlyChatId = null)
     {
-        BotUpdate? update = LoadBotUpdate();
+        BotUpdate? update = await LoadBotUpdateAsync(ct);
         if (update is null)
         {
             return;
@@ -157,8 +165,63 @@ class Program
         }
     }
 
-    private static BotUpdate? LoadBotUpdate()
+    private static async Task UpdatePollingLoopAsync(CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(UpdatesUrl))
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return;
+        }
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                BotUpdate? update = await LoadBotUpdateAsync(ct);
+                if (update is not null && !string.IsNullOrWhiteSpace(update.Version))
+                {
+                    string? lastVersion = LoadLastUpdateVersion();
+
+                    if (lastVersion is null)
+                    {
+                        SaveLastUpdateVersion(update.Version);
+                    }
+                    else if (!string.Equals(lastVersion, update.Version, StringComparison.Ordinal))
+                    {
+                        SaveLastUpdateVersion(update.Version);
+                        await SendBotUpdateAsync(ct);
+                        Console.WriteLine($"Обновление {update.Version} отправлено подписчикам.");
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не вдалося перевірити оновлення: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromMinutes(1), ct);
+        }
+    }
+
+    private static async Task<BotUpdate?> LoadBotUpdateAsync(CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(UpdatesUrl))
+        {
+            try
+            {
+                string remoteJson = await Http.GetStringAsync(UpdatesUrl, ct);
+                return JsonSerializer.Deserialize<BotUpdate>(remoteJson, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Не вдалося завантажити оновлення з GitHub: {ex.Message}");
+            }
+        }
+
         if (!File.Exists(UpdateFilePath))
         {
             return null;
@@ -173,6 +236,18 @@ class Program
             Console.WriteLine($"Не вдалося завантажити bot-update.json: {ex.Message}");
             return null;
         }
+    }
+
+    private static string? LoadLastUpdateVersion()
+    {
+        return File.Exists(UpdateVersionPath)
+            ? File.ReadAllText(UpdateVersionPath).Trim()
+            : null;
+    }
+
+    private static void SaveLastUpdateVersion(string version)
+    {
+        File.WriteAllText(UpdateVersionPath, version);
     }
 
     private static void LoadSubscriptions()
@@ -230,7 +305,6 @@ class Program
             if (text.Equals("/start", StringComparison.OrdinalIgnoreCase))
             {
                 await SendRegionsAsync(chatId, ct);
-                await SendBotUpdateAsync(ct, chatId);
             }
             else if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
@@ -247,6 +321,18 @@ class Program
             else if (text.Equals("/updates", StringComparison.OrdinalIgnoreCase))
             {
                 await SendBotUpdateAsync(ct, chatId);
+            }
+            else if (text.StartsWith("/maintenance", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!IsAdmin(message))
+                {
+                    await bot.SendMessage(chatId, "Ця команда доступна лише адміністратору.", cancellationToken: ct);
+                    return;
+                }
+
+                string customText = text["/maintenance".Length..].Trim();
+                await SendMaintenanceMessageAsync(string.IsNullOrWhiteSpace(customText) ? null : customText);
+                await bot.SendMessage(chatId, "Повідомлення про технічні роботи надіслано підписникам.", cancellationToken: ct);
             }
             else if (text.Equals("/stop", StringComparison.OrdinalIgnoreCase))
             {
@@ -413,7 +499,7 @@ class Program
     }
 
     private static Task SendHelpAsync(long chatId, CancellationToken ct) => Bot.SendMessage(chatId,
-        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/updates — останні оновлення\n/stop — вимкнути сповіщення\n/help — допомога\n\n" +
+        "/start — вибрати область і місто\n/status — поточний статус\n/alarm — є тривога?\n/updates — останні оновлення\n/help — допомога\n\n" +
         "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.", cancellationToken: ct);
 
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
