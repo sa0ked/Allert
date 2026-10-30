@@ -101,12 +101,97 @@ class Program
         ["Вишгородський район"] = new[] { "Вишгород", "Славутич", "Димер" },
         ["Обухівський район"] = new[] { "Обухів", "Українка", "Васильків" },
         ["Фастівський район"] = new[] { "Фастів", "Боярка", "Кагарлик" },
+        ["Голованівський район"] = new[] { "Голованівськ", "Гайворон", "Ульяновка" },
+        ["Кропивницький район"] = new[] { "Кропивницький", "Долинська", "Знам'янка" },
+        ["Новоукраїнський район"] = new[] { "Новоукраїнка", "Мала Виска", "Помічна" },
+        ["Олександрійський район"] = new[] { "Олександрія", "Світловодськ", "Знам'янка" },
+        ["Дрогобицький район"] = new[] { "Дрогобич", "Трускавець", "Борислав" },
+        ["Золочівський район"] = new[] { "Золочів", "Броди", "Буськ" },
+        ["Львівський район"] = new[] { "Львів", "Винники", "Жовква" },
+        ["Самбірський район"] = new[] { "Самбір", "Турка", "Добромиль" },
+        ["Стрийський район"] = new[] { "Стрий", "Моршин", "Сколе" },
+        ["Червоноградський район"] = new[] { "Червоноград", "Соснівка", "Радехів" },
+        ["Яворівський район"] = new[] { "Яворів", "Новояворівськ", "Мостиська" },
+        ["Баштанський район"] = new[] { "Баштанка", "Новий Буг", "Снігурівка" },
+        ["Вознесенський район"] = new[] { "Вознесенськ", "Южноукраїнськ", "Братське" },
+        ["Миколаївський район"] = new[] { "Миколаїв", "Очаків", "Нова Одеса" },
+        ["Первомайський район"] = new[] { "Первомайськ", "Южноукраїнськ", "Криве Озеро" },
+        ["Березівський район"] = new[] { "Березівка", "Раухівка", "Миколаївка" },
+        ["Білгород-Дністровський район"] = new[] { "Білгород-Дністровський", "Затока", "Сергіївка" },
+        ["Болградський район"] = new[] { "Болград", "Арциз", "Тарутине" },
+        ["Ізмаїльський район"] = new[] { "Ізмаїл", "Кілія", "Рені" },
+        ["Одеський район"] = new[] { "Одеса", "Чорноморськ", "Южне" },
+        ["Подільський район"] = new[] { "Подільськ", "Балта", "Кодима" },
+        ["Роздільнянський район"] = new[] { "Роздільна", "Великодолинське", "Лиманське" },
+        ["Кременчуцький район"] = new[] { "Кременчук", "Горішні Плавні", "Глобине" },
+        ["Лубенський район"] = new[] { "Лубни", "Хорол", "Пирятин" },
+        ["Миргородський район"] = new[] { "Миргород", "Гадяч", "Велика Багачка" },
+        ["Полтавський район"] = new[] { "Полтава", "Карлівка", "Диканька" },
+        ["Вараський район"] = new[] { "Вараш", "Зарічне", "Володимирець" },
+        ["Дубенський район"] = new[] { "Дубно", "Радивилів", "Млинів" },
+        ["Рівненський район"] = new[] { "Рівне", "Здолбунів", "Острог" },
+        ["Сарненський район"] = new[] { "Сарни", "Дубровиця", "Рокитне" },
+        ["Конотопський район"] = new[] { "Конотоп", "Буринь", "Кролевець" },
+        ["Охтирський район"] = new[] { "Охтирка", "Тростянець", "Лебедин" },
+        ["Роменський район"] = new[] { "Ромни", "Недригайлів", "Хмелів" },
+        ["Сумський район"] = new[] { "Суми", "Білопілля", "Тростянець" },
+        ["Шосткинський район"] = new[] { "Шостка", "Глухів", "Дружба" },
+        ["Кременецький район"] = new[] { "Кременець", "Почаїв", "Шумськ" },
+        ["Тернопільський район"] = new[] { "Тернопіль", "Збараж", "Бережани", "Зборів" },
+        ["Чортківський район"] = new[] { "Чортків", "Бучач", "Борщів", "Монастириська" },
+        ["Бериславський район"] = new[] { "Берислав", "Каховка", "Нова Каховка" },
+        ["Генічеський район"] = new[] { "Генічеськ", "Новоолексіївка", "Щасливцеве" },
+        ["Каховський район"] = new[] { "Каховка", "Нова Каховка", "Любимівка" },
+        ["Скадовський район"] = new[] { "Скадовськ", "Гола Пристань", "Лазурне" },
+        ["Херсонський район"] = new[] { "Херсон", "Олешки", "Білозерка" },
+        ["Кам'янець-Подільський район"] = new[] { "Кам'янець-Подільський", "Дунаївці", "Стара Ушиця" },
+        ["Хмельницький район"] = new[] { "Хмельницький", "Старокостянтинів", "Волочиськ" },
+        ["Шепетівський район"] = new[] { "Шепетівка", "Славута", "Нетішин" },
+        ["Звенигородський район"] = new[] { "Звенигородка", "Ватутіне", "Шпола" },
+        ["Золотоніський район"] = new[] { "Золотоноша", "Драбів", "Чорнобай" },
+        ["Уманський район"] = new[] { "Умань", "Христинівка", "Монастирище" },
+        ["Черкаський район"] = new[] { "Черкаси", "Канів", "Сміла" },
+        ["Вижницький район"] = new[] { "Вижниця", "Вашківці", "Путила" },
+        ["Дністровський район"] = new[] { "Хотин", "Кельменці", "Сокиряни" },
+        ["Чернівецький район"] = new[] { "Чернівці", "Новоселиця", "Сторожинець" },
+        ["Корюківський район"] = new[] { "Корюківка", "Мена", "Сновськ" },
+        ["Ніжинський район"] = new[] { "Ніжин", "Бахмач", "Борзна" },
+        ["Новгород-Сіверський район"] = new[] { "Новгород-Сіверський", "Семенівка", "Короп" },
+        ["Прилуцький район"] = new[] { "Прилуки", "Ічня", "Ладан" },
+        ["Чернігівський район"] = new[] { "Чернігів", "Батурин", "Козелець" },
         ["Ізюмський район"] = new[] { "Ізюм", "Барвінкове", "Борова", "Донецьке" },
         ["Харківський район"] = new[] { "Харків", "Дергачі", "Люботин", "Мерефа", "Південне" },
         ["Богодухівський район"] = new[] { "Богодухів", "Валки", "Краснокутськ" },
         ["Куп'янський район"] = new[] { "Куп'янськ", "Дворічна", "Шевченкове" },
         ["Лозівський район"] = new[] { "Лозова", "Первомайський", "Близнюки" },
         ["Чугуївський район"] = new[] { "Чугуїв", "Вовчанськ", "Зміїв", "Печеніги" }
+    };
+
+    private static readonly Dictionary<string, string> RegionalCenters = new()
+    {
+        ["Вінницька область"] = "Вінниця",
+        ["Волинська область"] = "Луцьк",
+        ["Дніпропетровська область"] = "Дніпро",
+        ["Донецька область"] = "Донецьк",
+        ["Житомирська область"] = "Житомир",
+        ["Закарпатська область"] = "Ужгород",
+        ["Запорізька область"] = "Запоріжжя",
+        ["Івано-Франківська область"] = "Івано-Франківськ",
+        ["Київська область"] = "Київ",
+        ["Кіровоградська область"] = "Кропивницький",
+        ["Львівська область"] = "Львів",
+        ["Миколаївська область"] = "Миколаїв",
+        ["Одеська область"] = "Одеса",
+        ["Полтавська область"] = "Полтава",
+        ["Рівненська область"] = "Рівне",
+        ["Сумська область"] = "Суми",
+        ["Тернопільська область"] = "Тернопіль",
+        ["Харківська область"] = "Харків",
+        ["Херсонська область"] = "Херсон",
+        ["Хмельницька область"] = "Хмельницький",
+        ["Черкаська область"] = "Черкаси",
+        ["Чернівецька область"] = "Чернівці",
+        ["Чернігівська область"] = "Чернігів"
     };
 
     static Program()
@@ -117,6 +202,25 @@ class Program
             {
                 string city = district.Replace(" район", "", StringComparison.OrdinalIgnoreCase);
                 CitiesByDistrict[district] = new[] { city };
+            }
+        }
+
+        foreach (KeyValuePair<string, string> item in RegionalCenters)
+        {
+            if (!DistrictsByRegion.TryGetValue(item.Key, out string[]? districts))
+            {
+                continue;
+            }
+
+            string? district = districts.FirstOrDefault(value =>
+                value.Contains(item.Value.Replace("і", "и", StringComparison.OrdinalIgnoreCase), StringComparison.OrdinalIgnoreCase) ||
+                item.Value.Contains(value.Replace(" район", "", StringComparison.OrdinalIgnoreCase), StringComparison.OrdinalIgnoreCase));
+
+            district ??= districts[0];
+            string[] cities = CitiesByDistrict[district];
+            if (!cities.Contains(item.Value, StringComparer.OrdinalIgnoreCase))
+            {
+                CitiesByDistrict[district] = cities.Append(item.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             }
         }
     }
@@ -214,6 +318,11 @@ class Program
     private static async Task SendBotUpdateAsync(CancellationToken ct, long? onlyChatId = null)
     {
         BotUpdate? update = await LoadBotUpdateAsync(ct);
+        await SendBotUpdateAsync(update, ct, onlyChatId);
+    }
+
+    private static async Task SendBotUpdateAsync(BotUpdate? update, CancellationToken ct, long? onlyChatId = null)
+    {
         if (update is null)
         {
             return;
@@ -226,7 +335,7 @@ class Program
 
         string text = $"📢 {update.Title}\n" +
                       $"Версія: {update.Version}\n" +
-                      $"Дата: {FormatTime(update.UpdatedAt)}\n\n" +
+                      $"Опубліковано: {FormatUpdateTime(update.UpdatedAt)}\n\n" +
                       changes;
 
         IEnumerable<long> recipients = onlyChatId.HasValue
@@ -262,6 +371,7 @@ class Program
                 if (update is not null && !string.IsNullOrWhiteSpace(update.Version))
                 {
                     string? lastVersion = LoadLastUpdateVersion();
+                    Console.WriteLine($"Перевірка оновлення: GitHub={update.Version}, збережена версія={lastVersion ?? "відсутня"}.");
 
                     if (lastVersion is null)
                     {
@@ -270,7 +380,7 @@ class Program
                     else if (!string.Equals(lastVersion, update.Version, StringComparison.Ordinal))
                     {
                         SaveLastUpdateVersion(update.Version);
-                        await SendBotUpdateAsync(ct);
+                        await SendBotUpdateAsync(update, ct);
                         Console.WriteLine($"Обновление {update.Version} отправлено подписчикам.");
                     }
                 }
@@ -294,7 +404,9 @@ class Program
         {
             try
             {
-                string remoteJson = await Http.GetStringAsync(UpdatesUrl, ct);
+                string separator = UpdatesUrl.Contains('?') ? "&" : "?";
+                string remoteJson = await Http.GetStringAsync(
+                    $"{UpdatesUrl}{separator}cacheBust={DateTimeOffset.UtcNow.ToUnixTimeSeconds()}", ct);
                 return JsonSerializer.Deserialize<BotUpdate>(remoteJson, JsonOptions);
             }
             catch (Exception ex)
@@ -806,6 +918,22 @@ class Program
             TimeSpan offset = KyivTimeZone.GetUtcOffset(kyivTime);
             DateTimeOffset exactKyivTime = new(kyivTime, offset);
             return $"{exactKyivTime:dd.MM.yyyy HH:mm:ss} (Київ)";
+        }
+
+        return value;
+    }
+
+    private static string FormatUpdateTime(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "невідомо";
+        }
+
+        if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal, out DateTimeOffset date))
+        {
+            return $"{TimeZoneInfo.ConvertTime(date, KyivTimeZone):dd.MM.yyyy HH:mm:ss} (Київ)";
         }
 
         return value;
