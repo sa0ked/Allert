@@ -1,1 +1,1 @@
-# Allert
+# Allert - This is a Telegram bot written @sa0ked., it notifies about air raid sirens in Ukraine. These files are needed to publish the bot to a hosting site or simply to the console. Please expand this repository, as the situation in Ukraine is very dire and Some people don't have the Air Raid Alert app. PS: !!Check the information in official sources!!
