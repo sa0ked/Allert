@@ -1,5 +1,4 @@
-﻿
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -197,7 +196,6 @@ class Program
         ["Чернігівська область"] = "Чернігів"
     };
 
-    // UID областей для alerts.in.ua
     private static readonly Dictionary<string, int> RegionUids = new()
     {
         ["Вінницька область"] = 4,
@@ -271,7 +269,9 @@ class Program
     };
 
     private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
-    private const string AdminUsername = "sa0ked";
+    
+    // Список администраторов бота
+    private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
 
     private static readonly string? AlertsHistoryToken =
         Environment.GetEnvironmentVariable("ALERTS_HISTORY_TOKEN");
@@ -355,10 +355,22 @@ class Program
 
     private static bool IsAdmin(Message message)
     {
-        return string.Equals(
-            message.From?.Username,
-            AdminUsername,
-            StringComparison.OrdinalIgnoreCase);
+        if (message.From?.Username == null)
+            return false;
+
+        return AdminUsernames.Contains(message.From.Username, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static async Task SendAdminInfoAsync(long chatId, CancellationToken ct)
+    {
+        string adminsList = string.Join("\n", AdminUsernames.Select(username => $"• @{username}"));
+        
+        string text = 
+            "👑 **Інформація про адміністраторів бота:**\n\n" +
+            adminsList + "\n\n" +
+            "З усіх питань роботи бота або пропозицій ви можете звертатися до них! 🫶";
+
+        await Bot.SendMessage(chatId, text, parseMode: ParseMode.Markdown, cancellationToken: ct);
     }
 
     private static async Task SendMaintenanceMessageAsync(string? customText = null)
@@ -619,6 +631,11 @@ class Program
             {
                 await SendHelpAsync(chatId, ct);
             }
+            else if (text.Equals("ℹ️ Інфо", StringComparison.OrdinalIgnoreCase) || text.Equals("/admin", StringComparison.OrdinalIgnoreCase))
+            {
+                StatusPresses.Remove(chatId);
+                await SendAdminInfoAsync(chatId, ct);
+            }
             else if (text.Equals("/status", StringComparison.OrdinalIgnoreCase))
             {
                 StatusPresses[chatId] = StatusPresses.GetValueOrDefault(chatId) + 1;
@@ -875,6 +892,7 @@ class Program
             "/alarm — є тривога?\n" +
             "/history — історія тривог\n" +
             "/updates — останні оновлення\n" +
+            "ℹ️ Інфо — інформація про адмінів\n" +
             "/help — допомога\n\n" +
             "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.",
             cancellationToken: ct);
@@ -883,14 +901,14 @@ class Program
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
     {
         new KeyboardButton[] { "Є тривога?", "Історія" },
-        new KeyboardButton[] { "/status", "/stop" }
+        new KeyboardButton[] { "/status", "ℹ️ Інфо" },
+        new KeyboardButton[] { "/stop" }
     })
     {
         ResizeKeyboard = true,
         IsPersistent = true
     };
 
-    // ІСТОРІЯ ТРИВОГ
     private static async Task SendCityHistoryAsync(long chatId, CancellationToken ct)
     {
         if (!Subscriptions.TryGetValue(chatId, out Subscription? subscription))
@@ -966,7 +984,6 @@ class Program
 
             string city = Normalize(subscription.City);
 
-            // Деякі громади в API мають назви, відмінні від назви міста.
             string[] aliases = subscription.City switch
             {
                 "Балаклія" => new[]
@@ -1504,7 +1521,7 @@ class Program
 
     private sealed record AlertState(
         bool IsAlert,
-        string UpdatedAt,
+        String UpdatedAt,
         string Level = "",
         bool HasData = true);
 }
