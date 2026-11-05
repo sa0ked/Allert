@@ -625,6 +625,7 @@ class Program
 
             if (text.Equals("/start", StringComparison.OrdinalIgnoreCase))
             {
+                ClearPendingSetup(chatId);
                 await SendRegionsAsync(chatId, ct);
             }
             else if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
@@ -640,6 +641,18 @@ class Program
             {
                 StatusPresses[chatId] = StatusPresses.GetValueOrDefault(chatId) + 1;
                 await SendStatusAsync(chatId, ct);
+            }
+            else if (text.Equals("🔄 Оновити", StringComparison.OrdinalIgnoreCase) ||
+                     text.Equals("/refresh", StringComparison.OrdinalIgnoreCase))
+            {
+                StatusPresses.Remove(chatId);
+                await SendAlarmStatusAsync(chatId, ct);
+            }
+            else if (text.Equals("📍 Моя підписка", StringComparison.OrdinalIgnoreCase) ||
+                     text.Equals("/subscription", StringComparison.OrdinalIgnoreCase))
+            {
+                StatusPresses.Remove(chatId);
+                await SendSubscriptionInfoAsync(chatId, ct);
             }
             else if (text.Equals("/alarm", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("Є тривога?", StringComparison.OrdinalIgnoreCase))
@@ -657,6 +670,30 @@ class Program
             {
                 StatusPresses.Remove(chatId);
                 await SendBotUpdateAsync(ct, chatId);
+            }
+            else if (text.Equals("/dadadaf", StringComparison.OrdinalIgnoreCase))
+            {
+                StatusPresses.Remove(chatId);
+                if (!IsAdmin(message))
+                {
+                    await bot.SendMessage(
+                        chatId,
+                        "⛔ Ця команда доступна лише адміністратору.",
+                        cancellationToken: ct);
+                    return;
+                }
+
+                await SendRegisteredUsersAsync(chatId, ct);
+            }
+            else if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase) ||
+                     text.Equals("Скасувати", StringComparison.OrdinalIgnoreCase))
+            {
+                ClearPendingSetup(chatId);
+                await bot.SendMessage(
+                    chatId,
+                    "Налаштування скасовано. Поточна підписка не змінена.",
+                    replyMarkup: GetStatusKeyboard(),
+                    cancellationToken: ct);
             }
             else if (text.StartsWith("/maintenance", StringComparison.OrdinalIgnoreCase))
             {
@@ -692,6 +729,7 @@ class Program
                 await bot.SendMessage(
                     chatId,
                     "Підписку вимкнено. Щоб підписатися знову — /start",
+                    replyMarkup: GetStatusKeyboard(),
                     cancellationToken: ct);
             }
             else if (AwaitingDistrictText.Remove(chatId))
@@ -753,6 +791,70 @@ class Program
         {
             Console.WriteLine($"Помилка обробки оновлення: {ex.Message}");
         }
+    }
+
+    private static void ClearPendingSetup(long chatId)
+    {
+        PendingRegions.Remove(chatId);
+        PendingDistricts.Remove(chatId);
+        AwaitingDistrictText.Remove(chatId);
+    }
+
+    private static async Task SendSubscriptionInfoAsync(long chatId, CancellationToken ct)
+    {
+        if (!Subscriptions.TryGetValue(chatId, out Subscription? subscription))
+        {
+            await Bot.SendMessage(
+                chatId,
+                "Підписки ще немає. Натисни /start, щоб обрати область і місто.",
+                replyMarkup: GetStatusKeyboard(),
+                cancellationToken: ct);
+            return;
+        }
+
+        await Bot.SendMessage(
+            chatId,
+            $"📍 Твоя підписка\nОбласть: {subscription.Region}\nРайон: {subscription.District}\nМісто: {subscription.City}\n\n" +
+            "Щоб змінити локацію, натисни /start. Щоб вимкнути сповіщення — /stop.",
+            replyMarkup: GetStatusKeyboard(),
+            cancellationToken: ct);
+    }
+
+    private static async Task SendRegisteredUsersAsync(long chatId, CancellationToken ct)
+    {
+        KeyValuePair<long, Subscription>[] users = Subscriptions
+            .OrderBy(item => item.Value.Region, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.Value.City, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (users.Length == 0)
+        {
+            await Bot.SendMessage(chatId, "Зареєстрованих підписок поки немає.", cancellationToken: ct);
+            return;
+        }
+
+        const int maxMessageLength = 3500;
+        string header = $"👥 Зареєстровані підписки: {users.Length}\n\n";
+        List<string> lines = new();
+        foreach ((long id, Subscription subscription) in users)
+        {
+            lines.Add($"• ID {id} — {subscription.City}, {subscription.District}, {subscription.Region}");
+        }
+
+        string chunk = header;
+        foreach (string line in lines)
+        {
+            if (chunk.Length + line.Length + Environment.NewLine.Length > maxMessageLength)
+            {
+                await Bot.SendMessage(chatId, chunk, cancellationToken: ct);
+                chunk = "👥 Продовження списку\n\n";
+            }
+
+            chunk += line + Environment.NewLine;
+        }
+
+        if (!string.IsNullOrWhiteSpace(chunk))
+            await Bot.SendMessage(chatId, chunk, cancellationToken: ct);
     }
 
     private static async Task HandleCallbackAsync(
@@ -889,7 +991,10 @@ class Program
             chatId,
             "/start — вибрати область і місто\n" +
             "/status — поточний статус\n" +
+            "/refresh — оновити статус зараз\n" +
             "/alarm — є тривога?\n" +
+            "/subscription — моя підписка\n" +
+            "/cancel — скасувати налаштування\n" +
             "/history — історія тривог\n" +
             "/updates — останні оновлення\n" +
             "ℹ️ Інфо — інформація про адмінів\n" +
@@ -900,8 +1005,8 @@ class Program
 
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
     {
-        new KeyboardButton[] { "Є тривога?", "Історія" },
-        new KeyboardButton[] { "/status", "ℹ️ Інфо" },
+        new KeyboardButton[] { "🔄 Оновити", "Є тривога?", "Історія" },
+        new KeyboardButton[] { "📍 Моя підписка", "/status", "ℹ️ Інфо" },
         new KeyboardButton[] { "/stop" }
     })
     {
@@ -924,7 +1029,9 @@ class Program
         {
             await Bot.SendMessage(
                 chatId,
-                "Історія недоступна: не налаштовано ALERTS_HISTORY_TOKEN.",
+                "📚 Історія поки не підключена. Для неї потрібен API-ключ alerts.in.ua.\n" +
+                "Адміністратору: додай ALERTS_HISTORY_TOKEN у змінні середовища бота та перезапусти його.",
+                replyMarkup: GetStatusKeyboard(),
                 cancellationToken: ct);
             return;
         }
@@ -1040,12 +1147,39 @@ class Program
                 .Take(10)
                 .ToList();
 
+            // Частина записів API має рівень району, а не міста/громади.
+            // Якщо точних міських записів немає, показуємо районну історію.
+            bool showingDistrictHistory = false;
+            if (cityAlerts.Count == 0)
+            {
+                string district = Normalize(subscription.District);
+                cityAlerts = alerts
+                    .EnumerateArray()
+                    .Where(item =>
+                    {
+                        string raion = Normalize(ReadString(item, "location_raion"));
+                        string oblast = ReadString(item, "location_oblast");
+                        string type = ReadString(item, "location_type");
+                        return raion.Contains(district) &&
+                               (string.IsNullOrWhiteSpace(oblast) || IsSameRegion(oblast, subscription.Region)) &&
+                               type.Equals("raion", StringComparison.OrdinalIgnoreCase);
+                    })
+                    .OrderByDescending(item =>
+                        DateTimeOffset.TryParse(ReadString(item, "started_at"), CultureInfo.InvariantCulture,
+                            DateTimeStyles.AssumeUniversal, out DateTimeOffset date)
+                                ? date
+                                : DateTimeOffset.MinValue)
+                    .Take(10)
+                    .ToList();
+                showingDistrictHistory = cityAlerts.Count > 0;
+            }
+
             if (cityAlerts.Count == 0)
             {
                 await Bot.SendMessage(
                     chatId,
-                    $"За останній місяць API не повернуло окремих записів історії для міста {subscription.City}.\n\n" +
-                    "Це не означає, що тривог не було. Джерело може зберігати записи на рівні району або громади.",
+                $"За останній місяць API не повернуло записів історії для {subscription.City} або {subscription.District}.\n\n" +
+                    "Це не означає, що тривог не було: джерело могло не надати історію для цієї локації.",
                     replyMarkup: GetStatusKeyboard(),
                     cancellationToken: ct);
                 return;
@@ -1053,7 +1187,9 @@ class Program
 
             List<string> lines = new()
             {
-                $"ІСТОРІЯ ТРИВОГ — {subscription.City}",
+                showingDistrictHistory
+                    ? $"ІСТОРІЯ ТРИВОГ — {subscription.District} (район)"
+                    : $"ІСТОРІЯ ТРИВОГ — {subscription.City}",
                 "Останні 10 записів за місяць:",
                 ""
             };
