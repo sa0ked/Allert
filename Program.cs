@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -262,6 +262,7 @@ class Program
     private static readonly Dictionary<long, string> PendingDistricts = new();
     private static readonly HashSet<long> AwaitingDistrictText = new();
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
+    private static readonly List<AlertHistoryEntry> AlertHistory = new();
     private static readonly SemaphoreSlim AlertsJsonLock = new(1, 1);
     private static string? CachedAlertsJson;
     private static DateTimeOffset AlertsJsonFetchedAt;
@@ -282,8 +283,7 @@ class Program
     private static readonly string? AlertsApiToken =
         Environment.GetEnvironmentVariable("ALERTS_API_TOKEN") ?? AlertsHistoryToken;
 
-    private static readonly string DataFilePath =
-        Path.Combine(AppContext.BaseDirectory, "bot-data.json");
+    private static readonly string DataFilePath = ResolveDataFilePath();
 
     private static readonly string UpdateFilePath =
         Path.Combine(AppContext.BaseDirectory, "bot-update.json");
@@ -294,17 +294,14 @@ class Program
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
     private static readonly object DataLock = new();
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
 
-    private static readonly string AlertsUrl =
-        Environment.GetEnvironmentVariable("ALERTS_API_URL") ??
-        (string.IsNullOrWhiteSpace(AlertsApiToken)
-            ? DefaultAlertsUrl
-            : "https://api.alerts.in.ua/v1/alerts/active.json");
+    private static readonly string AlertsUrl = DefaultAlertsUrl;
 
     private static readonly string? UpdatesUrl =
         Environment.GetEnvironmentVariable("UPDATES_URL");
@@ -544,6 +541,20 @@ class Program
         File.WriteAllText(UpdateVersionPath, version);
     }
 
+    private static string ResolveDataFilePath()
+    {
+        string? configuredPath = Environment.GetEnvironmentVariable("BOT_DATA_FILE");
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+            return Path.GetFullPath(configuredPath);
+
+        string workingDirectoryPath = Path.Combine(Directory.GetCurrentDirectory(), "bot-data.json");
+        if (File.Exists(workingDirectoryPath))
+            return workingDirectoryPath;
+
+        string executableDirectoryPath = Path.Combine(AppContext.BaseDirectory, "bot-data.json");
+        return File.Exists(executableDirectoryPath) ? executableDirectoryPath : workingDirectoryPath;
+    }
+
     private static void LoadSubscriptions()
     {
         if (!File.Exists(DataFilePath))
@@ -553,13 +564,35 @@ class Program
         {
             string json = File.ReadAllText(DataFilePath);
 
-            List<PersistedSubscription>? saved =
-                JsonSerializer.Deserialize<List<PersistedSubscription>>(json);
+            using JsonDocument document = JsonDocument.Parse(json);
+            List<PersistedSubscription>? saved;
 
-            if (saved is null)
+            if (document.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                // Backward compatibility with the original bot-data.json array.
+                saved = JsonSerializer.Deserialize<List<PersistedSubscription>>(json, JsonOptions);
+            }
+            else if (document.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                JsonElement root = document.RootElement;
+                saved = root.TryGetProperty("subscriptions", out JsonElement subscriptions)
+                    ? JsonSerializer.Deserialize<List<PersistedSubscription>>(subscriptions.GetRawText(), JsonOptions)
+                    : new List<PersistedSubscription>();
+
+                if (root.TryGetProperty("alertHistory", out JsonElement history) &&
+                    history.ValueKind == JsonValueKind.Array)
+                {
+                    AlertHistory.AddRange(
+                        JsonSerializer.Deserialize<List<AlertHistoryEntry>>(history.GetRawText(), JsonOptions)
+                        ?? new List<AlertHistoryEntry>());
+                }
+            }
+            else
+            {
                 return;
+            }
 
-            foreach (PersistedSubscription item in saved)
+            foreach (PersistedSubscription item in saved ?? new List<PersistedSubscription>())
             {
                 if (!string.IsNullOrWhiteSpace(item.Region) &&
                     !string.IsNullOrWhiteSpace(item.City))
@@ -571,7 +604,8 @@ class Program
                 }
             }
 
-            Console.WriteLine($"Завантажено підписок: {Subscriptions.Count}.");
+            Console.WriteLine(
+                $"Завантажено підписок: {Subscriptions.Count}; записів історії: {AlertHistory.Count}.");
         }
         catch (Exception ex)
         {
@@ -585,13 +619,13 @@ class Program
         {
             lock (DataLock)
             {
-                List<PersistedSubscription> saved = Subscriptions
-                    .Select(item => new PersistedSubscription(
+                PersistedBotData saved = new(
+                    Subscriptions.Select(item => new PersistedSubscription(
                         item.Key,
                         item.Value.Region,
                         item.Value.City,
-                        item.Value.District))
-                    .ToList();
+                        item.Value.District)).ToList(),
+                    AlertHistory.ToList());
 
                 string temporaryPath = DataFilePath + ".tmp";
 
@@ -1034,230 +1068,86 @@ class Program
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(AlertsHistoryToken))
+        List<AlertHistoryEntry> entries;
+        lock (DataLock)
         {
-            await Bot.SendMessage(
-                chatId,
-                "📚 Історія поки не підключена. Для неї потрібен API-ключ alerts.in.ua.\n" +
-                "Адміністратору: додай ALERTS_HISTORY_TOKEN у змінні середовища бота та перезапусти його.",
-                replyMarkup: GetStatusKeyboard(),
-                cancellationToken: ct);
-            return;
-        }
-
-        if (!RegionUids.TryGetValue(subscription.Region, out int regionUid))
-        {
-            await Bot.SendMessage(
-                chatId,
-                "Для цієї області не знайдено UID в API історії.",
-                cancellationToken: ct);
-            return;
-        }
-
-        try
-        {
-            string url =
-                $"https://api.alerts.in.ua/v1/regions/{regionUid}/alerts/month_ago.json";
-
-            using HttpRequestMessage request = new(HttpMethod.Get, url);
-
-            request.Headers.Authorization =
-                new AuthenticationHeaderValue("Bearer", AlertsHistoryToken);
-
-            using HttpResponseMessage response = await Http.SendAsync(request, ct);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                await Bot.SendMessage(
-                    chatId,
-                    $"Не вдалося отримати історію. Код API: {(int)response.StatusCode}.",
-                    cancellationToken: ct);
-                return;
-            }
-
-            string json = await response.Content.ReadAsStringAsync(ct);
-            using JsonDocument document = JsonDocument.Parse(json);
-
-            if (!document.RootElement.TryGetProperty("alerts", out JsonElement alerts) ||
-                alerts.ValueKind != JsonValueKind.Array)
-            {
-                await Bot.SendMessage(
-                    chatId,
-                    "API не повернуло список історії тривог.",
-                    cancellationToken: ct);
-                return;
-            }
-
-            string Normalize(string value)
-            {
-                return value.Trim()
-                    .Replace("'", "")
-                    .Replace("’", "")
-                    .Replace("ʼ", "")
-                    .Replace("м. ", "", StringComparison.OrdinalIgnoreCase)
-                    .ToLowerInvariant();
-            }
-
-            string city = Normalize(subscription.City);
-
-            string[] aliases = subscription.City switch
-            {
-                "Балаклія" => new[]
-                {
-                    "балаклійська територіальна громада",
-                    "балаклійська громада",
-                    "балаклійська"
-                },
-                "Барвінкове" => new[]
-                {
-                    "барвінківська територіальна громада",
-                    "барвінківська громада",
-                    "барвінківська"
-                },
-                "Ізюм" => new[]
-                {
-                    "ізюмська територіальна громада",
-                    "ізюмська громада",
-                    "ізюмська"
-                },
-                _ => Array.Empty<string>()
-            };
-
-            List<JsonElement> cityAlerts = alerts
-                .EnumerateArray()
-                .Where(item =>
-                {
-                    string title = Normalize(ReadString(item, "location_title"));
-                    string type = ReadString(item, "location_type");
-                    string oblast = ReadString(item, "location_oblast");
-
-                    bool cityMatches =
-                        title.Contains(city) ||
-                        aliases.Any(alias => title.Contains(Normalize(alias)));
-
-                    bool regionMatches =
-                        string.IsNullOrWhiteSpace(oblast) ||
-                        IsSameRegion(oblast, subscription.Region);
-
-                    bool typeMatches =
-                        type.Equals("city", StringComparison.OrdinalIgnoreCase) ||
-                        type.Equals("hromada", StringComparison.OrdinalIgnoreCase);
-
-                    return cityMatches && regionMatches && typeMatches;
-                })
-                .OrderByDescending(item =>
-                    DateTimeOffset.TryParse(
-                        ReadString(item, "started_at"),
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal,
-                        out DateTimeOffset date)
-                            ? date
-                            : DateTimeOffset.MinValue)
+            entries = AlertHistory
+                .Where(item => HistoryEntryMatches(item, subscription))
+                .OrderByDescending(item => item.StartedAt)
                 .Take(10)
                 .ToList();
+        }
 
-            // Частина записів API має рівень району, а не міста/громади.
-            // Якщо точних міських записів немає, показуємо районну історію.
-            bool showingDistrictHistory = false;
-            if (cityAlerts.Count == 0)
-            {
-                string district = Normalize(subscription.District);
-                cityAlerts = alerts
-                    .EnumerateArray()
-                    .Where(item =>
-                    {
-                        string raion = Normalize(ReadString(item, "location_raion"));
-                        string oblast = ReadString(item, "location_oblast");
-                        string type = ReadString(item, "location_type");
-                        return raion.Contains(district) &&
-                               (string.IsNullOrWhiteSpace(oblast) || IsSameRegion(oblast, subscription.Region)) &&
-                               type.Equals("raion", StringComparison.OrdinalIgnoreCase);
-                    })
-                    .OrderByDescending(item =>
-                        DateTimeOffset.TryParse(ReadString(item, "started_at"), CultureInfo.InvariantCulture,
-                            DateTimeStyles.AssumeUniversal, out DateTimeOffset date)
-                                ? date
-                                : DateTimeOffset.MinValue)
-                    .Take(10)
-                    .ToList();
-                showingDistrictHistory = cityAlerts.Count > 0;
-            }
+        if (entries.Count == 0)
+        {
+            await Bot.SendMessage(
+                chatId,
+                $"📚 Історія для {subscription.City} поки порожня.\n\n" +
+                "Бот почне записувати тривоги й відбої, щойно побачить зміну статусу. " +
+                "Записи зберігаються локально у bot-data.json.",
+                replyMarkup: GetStatusKeyboard(),
+                cancellationToken: ct);
+            return;
+        }
 
-            if (cityAlerts.Count == 0)
-            {
-                await Bot.SendMessage(
-                    chatId,
-                $"За останній місяць API не повернуло записів історії для {subscription.City} або {subscription.District}.\n\n" +
-                    "Це не означає, що тривог не було: джерело могло не надати історію для цієї локації.",
-                    replyMarkup: GetStatusKeyboard(),
-                    cancellationToken: ct);
-                return;
-            }
+        List<string> lines = new()
+        {
+            $"📚 ІСТОРІЯ ТРИВОГ — {subscription.City}",
+            $"{subscription.District}, {subscription.Region}",
+            "Останні 10 подій, зафіксованих ботом:",
+            ""
+        };
 
-            List<string> lines = new()
+        foreach (AlertHistoryEntry entry in entries)
+        {
+            DateTimeOffset finishedAt = entry.FinishedAt ?? DateTimeOffset.UtcNow;
+            TimeSpan duration = finishedAt - entry.StartedAt;
+            string durationText = FormatHistoryDuration(duration);
+            string scopeLabel = entry.Scope switch
             {
-                showingDistrictHistory
-                    ? $"ІСТОРІЯ ТРИВОГ — {subscription.District} (район)"
-                    : $"ІСТОРІЯ ТРИВОГ — {subscription.City}",
-                "Останні 10 записів за місяць:",
-                ""
+                "місто" => "місто/громада",
+                "район" => "район",
+                _ => "область"
             };
 
-            foreach (JsonElement alert in cityAlerts)
-            {
-                string started = ReadString(alert, "started_at");
-                string finished = ReadString(alert, "finished_at");
-
-                string duration = "невідомо";
-
-                if (DateTimeOffset.TryParse(
-                        started,
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal,
-                        out DateTimeOffset start) &&
-                    DateTimeOffset.TryParse(
-                        finished,
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal,
-                        out DateTimeOffset end))
-                {
-                    TimeSpan span = end - start;
-
-                    duration = span.TotalHours >= 1
-                        ? $"{(int)span.TotalHours} год. {span.Minutes} хв."
-                        : $"{span.Minutes} хв.";
-                }
-
-                lines.Add(
-                    $"Тривога: {FormatUpdateTime(started)}\n" +
-                    $"Відбій: {(string.IsNullOrWhiteSpace(finished) ? "ще триває або невідомо" : FormatUpdateTime(finished))}\n" +
-                    $"Тривалість: {duration}\n");
-            }
-
-            lines.Add("Джерело: alerts.in.ua");
-
-            await Bot.SendMessage(
-                chatId,
-                string.Join("\n", lines),
-                replyMarkup: GetStatusKeyboard(),
-                cancellationToken: ct);
+            lines.Add(
+                $"{(entry.FinishedAt.HasValue ? "✅" : "🚨")} {FormatUpdateTime(entry.StartedAt.ToString("O"))}\n" +
+                $"{(entry.FinishedAt.HasValue ? "Відбій" : "Триває зараз")} · {durationText}\n" +
+                $"Рівень запису: {scopeLabel}\n");
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Помилка історії тривог: {ex.Message}");
 
-            await Bot.SendMessage(
-                chatId,
-                "Не вдалося завантажити історію тривог. Спробуй пізніше.",
-                replyMarkup: GetStatusKeyboard(),
-                cancellationToken: ct);
-        }
+        lines.Add("Дані накопичуються ботом із моменту запуску цієї версії.");
+
+        await Bot.SendMessage(
+            chatId,
+            string.Join("\n", lines),
+            replyMarkup: GetStatusKeyboard(),
+            cancellationToken: ct);
     }
 
+    private static bool HistoryEntryMatches(AlertHistoryEntry entry, Subscription subscription)
+    {
+        if (!IsSameRegion(entry.Region, subscription.Region))
+            return false;
+
+        return entry.Scope switch
+        {
+            "місто" => string.Equals(entry.City, subscription.City, StringComparison.OrdinalIgnoreCase),
+            "район" => string.Equals(entry.District, subscription.District, StringComparison.OrdinalIgnoreCase),
+            _ => true
+        };
+    }
+
+    private static string FormatHistoryDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+            return "невідомо";
+        if (duration.TotalDays >= 1)
+            return $"{(int)duration.TotalDays} дн. {duration.Hours} год.";
+        if (duration.TotalHours >= 1)
+            return $"{(int)duration.TotalHours} год. {duration.Minutes} хв.";
+        return $"{Math.Max(0, duration.Minutes)} хв.";
+    }
     private static async Task SendAlarmStatusAsync(long chatId, CancellationToken ct)
     {
         if (!Subscriptions.TryGetValue(chatId, out Subscription? subscription))
@@ -1324,10 +1214,20 @@ class Program
                     AlertState state = await GetAlertStateAsync(subscription, ct);
                     string stateKey = GetSubscriptionStateKey(subscription);
 
-                    if (!LastStates.TryGetValue(stateKey, out AlertState? previous) ||
-                        previous.IsAlert != state.IsAlert)
+                    if (!state.HasData)
+                        continue;
+
+                    if (!LastStates.TryGetValue(stateKey, out AlertState? previous))
                     {
                         LastStates[stateKey] = state;
+                        ReconcileHistoryOnStartup(stateKey, subscription, state);
+                        continue;
+                    }
+
+                    if (previous.IsAlert != state.IsAlert)
+                    {
+                        LastStates[stateKey] = state;
+                        RecordAlertTransition(stateKey, subscription, state);
 
                         foreach (KeyValuePair<long, Subscription> item in group)
                         {
@@ -1337,6 +1237,10 @@ class Program
                                 cancellationToken: ct);
                         }
                     }
+                    else
+                    {
+                        LastStates[stateKey] = state;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1345,6 +1249,144 @@ class Program
             }
 
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
+        }
+    }
+
+    private static void ReconcileHistoryOnStartup(
+        string stateKey,
+        Subscription subscription,
+        AlertState state)
+    {
+        bool changed = false;
+        lock (DataLock)
+        {
+            if (state.IsAlert)
+            {
+                if (!AlertHistory.Any(item => item.StateKey == stateKey && !item.FinishedAt.HasValue))
+                {
+                    AlertHistory.Add(new AlertHistoryEntry(
+                        stateKey,
+                        subscription.Region,
+                        subscription.District,
+                        subscription.City,
+                        GetHistoryTimestamp(state.UpdatedAt),
+                        null,
+                        state.Scope));
+                    changed = true;
+                }
+            }
+            else
+            {
+                changed = CloseOpenHistoryEntry(stateKey, state.UpdatedAt);
+            }
+
+            TrimAlertHistory();
+        }
+
+        if (changed)
+            SaveSubscriptions();
+    }
+
+    private static void RecordAlertTransition(
+        string stateKey,
+        Subscription subscription,
+        AlertState state)
+    {
+        lock (DataLock)
+        {
+            if (state.IsAlert)
+            {
+                AlertHistory.Add(new AlertHistoryEntry(
+                    stateKey,
+                    subscription.Region,
+                    subscription.District,
+                    subscription.City,
+                    GetHistoryTimestamp(state.UpdatedAt),
+                    null,
+                    state.Scope));
+            }
+            else
+            {
+                CloseOpenHistoryEntry(stateKey, state.UpdatedAt);
+            }
+
+            TrimAlertHistory();
+        }
+
+        SaveSubscriptions();
+    }
+
+    private static bool CloseOpenHistoryEntry(string stateKey, string sourceTime)
+    {
+        int index = AlertHistory.FindLastIndex(item =>
+            item.StateKey == stateKey && !item.FinishedAt.HasValue);
+
+        if (index < 0)
+            return false;
+
+        AlertHistoryEntry entry = AlertHistory[index];
+        DateTimeOffset finishedAt = GetHistoryTimestamp(sourceTime);
+        if (finishedAt < entry.StartedAt)
+            finishedAt = DateTimeOffset.UtcNow;
+
+        AlertHistory[index] = entry with { FinishedAt = finishedAt };
+        return true;
+    }
+
+    private static DateTimeOffset GetHistoryTimestamp(string sourceTime)
+    {
+        if (!string.IsNullOrWhiteSpace(sourceTime))
+        {
+            int timeSeparator = sourceTime.IndexOf('T');
+            if (timeSeparator < 0)
+                timeSeparator = sourceTime.IndexOf(' ');
+
+            bool hasExplicitOffset = sourceTime.EndsWith("Z", StringComparison.OrdinalIgnoreCase) ||
+                sourceTime.Contains('+') ||
+                (timeSeparator >= 0 && sourceTime.LastIndexOf('-') > timeSeparator);
+
+            if (hasExplicitOffset && DateTimeOffset.TryParse(
+                    sourceTime,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AllowWhiteSpaces,
+                    out DateTimeOffset timestamp))
+            {
+                return timestamp.ToUniversalTime();
+            }
+
+            if (DateTime.TryParse(sourceTime, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AllowWhiteSpaces, out DateTime localTime))
+            {
+                if (localTime.Kind == DateTimeKind.Utc)
+                    return new DateTimeOffset(localTime);
+
+                DateTime unspecified = DateTime.SpecifyKind(localTime, DateTimeKind.Unspecified);
+                return new DateTimeOffset(unspecified, KyivTimeZone.GetUtcOffset(unspecified)).ToUniversalTime();
+            }
+        }
+
+        return DateTimeOffset.UtcNow;
+    }
+
+    private static void TrimAlertHistory()
+    {
+        const int maxEntries = 5000;
+        if (AlertHistory.Count <= maxEntries)
+            return;
+
+        int excess = AlertHistory.Count - maxEntries;
+        List<AlertHistoryEntry> oldestFinished = AlertHistory
+            .Where(item => item.FinishedAt.HasValue)
+            .OrderBy(item => item.FinishedAt)
+            .Take(excess)
+            .ToList();
+        foreach (AlertHistoryEntry item in oldestFinished)
+            AlertHistory.Remove(item);
+
+        if (AlertHistory.Count > maxEntries)
+        {
+            AlertHistory.Sort((left, right) => left.StartedAt.CompareTo(right.StartedAt));
+            AlertHistory.RemoveRange(0, AlertHistory.Count - maxEntries);
         }
     }
 
@@ -1733,6 +1775,8 @@ class Program
 
         string source = uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase)
             ? "alerts.in.ua"
+            : uri.Host.Equals("ubilling.net.ua", StringComparison.OrdinalIgnoreCase)
+                ? "UBilling (статуси по областях)"
             : uri.Host.Equals("jaam.net.ua", StringComparison.OrdinalIgnoreCase)
                 ? "JAAM (jaam.net.ua)"
                 : uri.Host;
@@ -1884,6 +1928,19 @@ class Program
         string Region,
         string City,
         string? District);
+
+    private sealed record PersistedBotData(
+        List<PersistedSubscription> Subscriptions,
+        List<AlertHistoryEntry> AlertHistory);
+
+    private sealed record AlertHistoryEntry(
+        string StateKey,
+        string Region,
+        string District,
+        string City,
+        DateTimeOffset StartedAt,
+        DateTimeOffset? FinishedAt,
+        string Scope);
 
     private sealed record BotUpdate(
         string Version,
