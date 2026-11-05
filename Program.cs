@@ -262,13 +262,16 @@ class Program
     private static readonly Dictionary<long, string> PendingDistricts = new();
     private static readonly HashSet<long> AwaitingDistrictText = new();
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
+    private static readonly SemaphoreSlim AlertsJsonLock = new(1, 1);
+    private static string? CachedAlertsJson;
+    private static DateTimeOffset AlertsJsonFetchedAt;
 
     private static readonly HttpClient Http = new()
     {
         Timeout = TimeSpan.FromSeconds(20)
     };
 
-    private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
+    private const string DefaultAlertsUrl = "https://jaam.net.ua/alerts_statuses_v1.json";
     
     // Список администраторов бота
     private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
@@ -1341,11 +1344,7 @@ class Program
         string region,
         CancellationToken ct)
     {
-        using HttpResponseMessage response = await Http.GetAsync(AlertsUrl, ct);
-
-        response.EnsureSuccessStatusCode();
-
-        string json = await response.Content.ReadAsStringAsync(ct);
+        string json = await GetAlertsJsonAsync(ct);
         using JsonDocument document = JsonDocument.Parse(json);
 
         JsonElement root = document.RootElement;
@@ -1365,19 +1364,25 @@ class Program
         {
             foreach (JsonProperty property in records.EnumerateObject())
             {
-                if (!IsSameRegion(property.Name, region) ||
-                    property.Value.ValueKind != JsonValueKind.Object)
+                if (!IsSameRegion(property.Name, region))
                     continue;
 
-                bool isAlert =
-                    property.Value.TryGetProperty("alertnow", out JsonElement alertValue) &&
-                    alertValue.ValueKind == JsonValueKind.True;
+                if (property.Value.ValueKind == JsonValueKind.True ||
+                    property.Value.ValueKind == JsonValueKind.False)
+                {
+                    return new AlertState(property.Value.GetBoolean(), "", HasData: true);
+                }
 
-                string changed = ReadString(
-                    property.Value,
-                    "changed",
-                    "updated_at",
-                    "updatedAt");
+                if (property.Value.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                bool? alertStatus = ReadBoolean(property.Value, "enabled", "alertnow", "alert");
+                if (alertStatus is null)
+                    continue;
+
+                string changed = alertStatus.Value
+                    ? ReadString(property.Value, "enabled_at", "changed", "updated_at", "updatedAt")
+                    : ReadString(property.Value, "disabled_at", "changed", "updated_at", "updatedAt");
 
                 string level = ReadString(
                     property.Value,
@@ -1387,7 +1392,7 @@ class Program
                     "color",
                     "severity");
 
-                return new AlertState(isAlert, changed, level);
+                return new AlertState(alertStatus.Value, changed, level);
             }
 
             return new AlertState(false, "", HasData: false);
@@ -1425,6 +1430,45 @@ class Program
         }
 
         return new AlertState(false, "", HasData: false);
+    }
+
+    private static async Task<string> GetAlertsJsonAsync(CancellationToken ct)
+    {
+        await AlertsJsonLock.WaitAsync(ct);
+        try
+        {
+            if (CachedAlertsJson is not null &&
+                DateTimeOffset.UtcNow - AlertsJsonFetchedAt < TimeSpan.FromSeconds(30))
+            {
+                return CachedAlertsJson;
+            }
+
+            using HttpResponseMessage response = await Http.GetAsync(AlertsUrl, ct);
+            response.EnsureSuccessStatusCode();
+            CachedAlertsJson = await response.Content.ReadAsStringAsync(ct);
+            AlertsJsonFetchedAt = DateTimeOffset.UtcNow;
+            return CachedAlertsJson;
+        }
+        finally
+        {
+            AlertsJsonLock.Release();
+        }
+    }
+
+    private static bool? ReadBoolean(JsonElement item, params string[] names)
+    {
+        foreach (string name in names)
+        {
+            if (item.TryGetProperty(name, out JsonElement value))
+            {
+                if (value.ValueKind == JsonValueKind.True)
+                    return true;
+                if (value.ValueKind == JsonValueKind.False)
+                    return false;
+            }
+        }
+
+        return null;
     }
 
     private static string ReadString(JsonElement item, params string[] names)
@@ -1474,12 +1518,14 @@ class Program
               $"Регіон: {region}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Негайно пройди до укриття та стеж за офіційними повідомленнями."
+              "Негайно пройди до укриття та стеж за офіційними повідомленнями.\n" +
+              GetAlertsSourceText()
             : $"✅ Відбій повітряної тривоги\n" +
               $"Регіон: {region}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Все одно перевіряй офіційні джерела.";
+              "Все одно перевіряй офіційні джерела.\n" +
+              GetAlertsSourceText();
     }
 
     private static string FormatAlarmStatus(AlertState state, string region)
@@ -1488,7 +1534,8 @@ class Program
         {
             return $"⚠️ Немає актуальних даних про статус тривоги.\n" +
                    $"Регіон: {region}\n\n" +
-                   "Перевір офіційні джерела цивільного захисту.";
+                   "Перевір офіційні джерела цивільного захисту.\n" +
+                   GetAlertsSourceText();
         }
 
         return state.IsAlert
@@ -1496,12 +1543,21 @@ class Program
               $"Регіон: {region}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Пройди до укриття та стеж за офіційними повідомленнями."
+              "Пройди до укриття та стеж за офіційними повідомленнями.\n" +
+              GetAlertsSourceText()
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\n" +
               $"Регіон: {region}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Інформація може змінитися — перевіряй офіційні джерела.";
+              "Інформація може змінитися — перевіряй офіційні джерела.\n" +
+              GetAlertsSourceText();
+    }
+
+    private static string GetAlertsSourceText()
+    {
+        return Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri)
+            ? $"Дані: {uri.Host}"
+            : "Джерело: API статусів тривог";
     }
 
     private static string FormatAlertLevel(string level)
