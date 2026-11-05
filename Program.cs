@@ -271,13 +271,16 @@ class Program
         Timeout = TimeSpan.FromSeconds(20)
     };
 
-    private const string DefaultAlertsUrl = "https://jaam.net.ua/alerts_statuses_v1.json";
+    private const string DefaultAlertsUrl = "https://ubilling.net.ua/aerialalerts/";
     
     // Список администраторов бота
     private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
 
     private static readonly string? AlertsHistoryToken =
         Environment.GetEnvironmentVariable("ALERTS_HISTORY_TOKEN");
+
+    private static readonly string? AlertsApiToken =
+        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN") ?? AlertsHistoryToken;
 
     private static readonly string DataFilePath =
         Path.Combine(AppContext.BaseDirectory, "bot-data.json");
@@ -298,7 +301,10 @@ class Program
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
 
     private static readonly string AlertsUrl =
-        Environment.GetEnvironmentVariable("ALERTS_API_URL") ?? DefaultAlertsUrl;
+        Environment.GetEnvironmentVariable("ALERTS_API_URL") ??
+        (string.IsNullOrWhiteSpace(AlertsApiToken)
+            ? DefaultAlertsUrl
+            : "https://api.alerts.in.ua/v1/alerts/active.json");
 
     private static readonly string? UpdatesUrl =
         Environment.GetEnvironmentVariable("UPDATES_URL");
@@ -1263,11 +1269,11 @@ class Program
             return;
         }
 
-        AlertState state = await GetAlertStateAsync(subscription.Region, ct);
+        AlertState state = await GetAlertStateAsync(subscription, ct);
 
         await Bot.SendMessage(
             chatId,
-            FormatAlarmStatus(state, subscription.Region),
+            FormatAlarmStatus(state, subscription),
             replyMarkup: GetStatusKeyboard(),
             cancellationToken: ct);
     }
@@ -1283,7 +1289,7 @@ class Program
             return;
         }
 
-        AlertState state = await GetAlertStateAsync(subscription.Region, ct);
+        AlertState state = await GetAlertStateAsync(subscription, ct);
         int presses = StatusPresses.GetValueOrDefault(chatId);
 
         if (presses >= 10)
@@ -1300,7 +1306,7 @@ class Program
 
         await Bot.SendMessage(
             chatId,
-            FormatAlert(state, subscription.Region),
+            FormatAlert(state, subscription),
             replyMarkup: GetStatusKeyboard(),
             cancellationToken: ct);
     }
@@ -1310,22 +1316,24 @@ class Program
         while (!ct.IsCancellationRequested)
         {
             foreach (IGrouping<string, KeyValuePair<long, Subscription>> group
-                     in Subscriptions.GroupBy(x => x.Value.Region))
+                     in Subscriptions.GroupBy(x => GetSubscriptionStateKey(x.Value)))
             {
                 try
                 {
-                    AlertState state = await GetAlertStateAsync(group.Key, ct);
+                    Subscription subscription = group.First().Value;
+                    AlertState state = await GetAlertStateAsync(subscription, ct);
+                    string stateKey = GetSubscriptionStateKey(subscription);
 
-                    if (!LastStates.TryGetValue(group.Key, out AlertState? previous) ||
+                    if (!LastStates.TryGetValue(stateKey, out AlertState? previous) ||
                         previous.IsAlert != state.IsAlert)
                     {
-                        LastStates[group.Key] = state;
+                        LastStates[stateKey] = state;
 
                         foreach (KeyValuePair<long, Subscription> item in group)
                         {
                             await Bot.SendMessage(
                                 item.Key,
-                                FormatAlert(state, item.Value.Region),
+                                FormatAlert(state, item.Value),
                                 cancellationToken: ct);
                         }
                     }
@@ -1340,10 +1348,22 @@ class Program
         }
     }
 
+    private static string GetSubscriptionStateKey(Subscription subscription)
+    {
+        if (Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri) &&
+            uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{subscription.Region}|{subscription.District}|{subscription.City}";
+        }
+
+        return subscription.Region;
+    }
+
     private static async Task<AlertState> GetAlertStateAsync(
-        string region,
+        Subscription subscription,
         CancellationToken ct)
     {
+        string region = subscription.Region;
         string json = await GetAlertsJsonAsync(ct);
         using JsonDocument document = JsonDocument.Parse(json);
 
@@ -1359,6 +1379,10 @@ class Program
                       root.TryGetProperty("alerts", out JsonElement alerts)
                         ? alerts
                         : default;
+        bool isActiveAlertsFeed =
+            root.ValueKind == JsonValueKind.Object &&
+            root.TryGetProperty("alerts", out JsonElement activeAlerts) &&
+            activeAlerts.ValueKind == JsonValueKind.Array;
 
         if (records.ValueKind == JsonValueKind.Object)
         {
@@ -1370,7 +1394,7 @@ class Program
                 if (property.Value.ValueKind == JsonValueKind.True ||
                     property.Value.ValueKind == JsonValueKind.False)
                 {
-                    return new AlertState(property.Value.GetBoolean(), "", HasData: true);
+                    return new AlertState(property.Value.GetBoolean(), "", HasData: true, Scope: "область");
                 }
 
                 if (property.Value.ValueKind != JsonValueKind.Object)
@@ -1392,7 +1416,7 @@ class Program
                     "color",
                     "severity");
 
-                return new AlertState(alertStatus.Value, changed, level);
+                return new AlertState(alertStatus.Value, changed, level, Scope: "область");
             }
 
             return new AlertState(false, "", HasData: false);
@@ -1403,6 +1427,12 @@ class Program
 
         foreach (JsonElement item in records.EnumerateArray())
         {
+            string alertType = ReadString(item, "alert_type");
+            if (isActiveAlertsFeed &&
+                !string.IsNullOrWhiteSpace(alertType) &&
+                !alertType.Equals("air_raid", StringComparison.OrdinalIgnoreCase))
+                continue;
+
             string title = ReadString(
                 item,
                 "location_title",
@@ -1410,7 +1440,18 @@ class Program
                 "location",
                 "name");
 
-            if (!IsSameRegion(title, region))
+            string oblast = ReadString(item, "location_oblast");
+            if (isActiveAlertsFeed)
+            {
+                if (!TryMatchActiveAlert(item, subscription, out string scope))
+                    continue;
+
+                string activeStart = ReadString(item, "started_at", "updated_at", "updatedAt");
+                string activeLevel = ReadString(item, "alert_level", "level", "color");
+                return new AlertState(true, activeStart, activeLevel, Scope: scope);
+            }
+
+            if (!IsSameRegion(title, region) && !IsSameRegion(oblast, region))
                 continue;
 
             string updatedAt = ReadString(
@@ -1426,10 +1467,110 @@ class Program
                 "alert_level",
                 "color");
 
-            return new AlertState(true, updatedAt, level);
+            return new AlertState(true, updatedAt, level, Scope: "область");
         }
 
-        return new AlertState(false, "", HasData: false);
+        return new AlertState(
+            false,
+            "",
+            HasData: isActiveAlertsFeed,
+            Scope: isActiveAlertsFeed ? "місто" : "область");
+    }
+
+    private static bool TryMatchActiveAlert(
+        JsonElement alert,
+        Subscription subscription,
+        out string scope)
+    {
+        string title = ReadString(alert, "location_title", "location", "name");
+        string type = ReadString(alert, "location_type");
+        string oblast = ReadString(alert, "location_oblast");
+        string raion = ReadString(alert, "location_raion");
+
+        if (!string.IsNullOrWhiteSpace(oblast) &&
+            !IsSameRegion(oblast, subscription.Region))
+        {
+            scope = "місто";
+            return false;
+        }
+
+        string normalizedTitle = NormalizeLocationName(title);
+        string normalizedCity = NormalizeLocationName(subscription.City);
+        string normalizedDistrict = NormalizeLocationName(subscription.District);
+        string normalizedRaion = NormalizeLocationName(raion);
+
+        bool exactCityMatch =
+            normalizedTitle == normalizedCity ||
+            normalizedTitle.StartsWith("місто" + normalizedCity, StringComparison.Ordinal) ||
+            normalizedTitle.StartsWith("м" + normalizedCity, StringComparison.Ordinal);
+
+        bool communityMatch =
+            type.Equals("hromada", StringComparison.OrdinalIgnoreCase) &&
+            GetCityNameRoots(normalizedCity).Any(root => normalizedTitle.StartsWith(root, StringComparison.Ordinal));
+
+        if (exactCityMatch || communityMatch)
+        {
+            scope = "місто";
+            return true;
+        }
+
+        bool districtMatch =
+            (type.Equals("raion", StringComparison.OrdinalIgnoreCase) ||
+             type.Equals("district", StringComparison.OrdinalIgnoreCase)) &&
+            (normalizedTitle == normalizedDistrict || normalizedRaion == normalizedDistrict);
+
+        if (districtMatch)
+        {
+            scope = "район";
+            return true;
+        }
+
+        bool oblastMatch =
+            type.Equals("oblast", StringComparison.OrdinalIgnoreCase) ||
+            IsSameRegion(title, subscription.Region);
+
+        if (oblastMatch &&
+            (string.IsNullOrWhiteSpace(oblast) || IsSameRegion(oblast, subscription.Region)))
+        {
+            scope = "область";
+            return true;
+        }
+
+        scope = "місто";
+        return false;
+    }
+
+    private static IEnumerable<string> GetCityNameRoots(string city)
+    {
+        yield return city;
+
+        string[] suffixes = { "ка", "ія", "я", "а", "о", "е", "ий", "ій", "ь" };
+        foreach (string suffix in suffixes)
+        {
+            if (!city.EndsWith(suffix, StringComparison.Ordinal))
+                continue;
+
+            string root = city[..^suffix.Length];
+            if (root.Length >= 4)
+                yield return root;
+        }
+    }
+
+    private static string NormalizeLocationName(string value)
+    {
+        string normalized = value
+            .Replace("'", "")
+            .Replace("’", "")
+            .Replace("ʼ", "")
+            .Replace("територіальна громада", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("громада", "", StringComparison.OrdinalIgnoreCase)
+            .Replace(" район", "", StringComparison.OrdinalIgnoreCase)
+            .Replace(" область", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("місто", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("м. ", "", StringComparison.OrdinalIgnoreCase)
+            .ToLowerInvariant();
+
+        return new string(normalized.Where(char.IsLetterOrDigit).ToArray());
     }
 
     private static async Task<string> GetAlertsJsonAsync(CancellationToken ct)
@@ -1443,7 +1584,15 @@ class Program
                 return CachedAlertsJson;
             }
 
-            using HttpResponseMessage response = await Http.GetAsync(AlertsUrl, ct);
+            using HttpRequestMessage request = new(HttpMethod.Get, AlertsUrl);
+            if (!string.IsNullOrWhiteSpace(AlertsApiToken) &&
+                Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? alertsUri) &&
+                alertsUri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase))
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AlertsApiToken);
+            }
+
+            using HttpResponseMessage response = await Http.SendAsync(request, ct);
             response.EnsureSuccessStatusCode();
             CachedAlertsJson = await response.Content.ReadAsStringAsync(ct);
             AlertsJsonFetchedAt = DateTimeOffset.UtcNow;
@@ -1504,8 +1653,9 @@ class Program
             StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string FormatAlert(AlertState state, string region)
+    private static string FormatAlert(AlertState state, Subscription subscription)
     {
+        string region = subscription.Region;
         if (!state.HasData)
         {
             return $"⚠️ Немає актуальних даних про статус тривоги.\n" +
@@ -1513,23 +1663,30 @@ class Program
                    "Перевір офіційні джерела цивільного захисту.";
         }
 
+        string place = GetAlertScopeText(state, subscription);
+
         return state.IsAlert
-            ? $"🚨 ТРИВОГА\n{FormatAlertLevel(state.Level)}\n" +
-              $"Регіон: {region}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ ТРИВОГА В ОБЛАСТІ" : "🚨 ТРИВОГА")}\n{FormatAlertLevel(state.Level)}\n" +
+              $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Негайно пройди до укриття та стеж за офіційними повідомленнями.\n" +
+              (state.Scope == "область"
+                  ? "Джерело не підтверджує окремо статус твого міста. Перевір місцеві офіційні повідомлення.\n"
+                  : "Негайно пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Відбій повітряної тривоги\n" +
-              $"Регіон: {region}\n" +
+              $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Все одно перевіряй офіційні джерела.\n" +
+              (state.Scope == "область"
+                  ? "API не надає окремий статус твого міста; перевір місцеві офіційні повідомлення.\n"
+                  : "Все одно перевіряй офіційні джерела.\n") +
               GetAlertsSourceText();
     }
 
-    private static string FormatAlarmStatus(AlertState state, string region)
+    private static string FormatAlarmStatus(AlertState state, Subscription subscription)
     {
+        string region = subscription.Region;
         if (!state.HasData)
         {
             return $"⚠️ Немає актуальних даних про статус тривоги.\n" +
@@ -1538,26 +1695,49 @@ class Program
                    GetAlertsSourceText();
         }
 
+        string place = GetAlertScopeText(state, subscription);
+
         return state.IsAlert
-            ? $"🚨 Так, є повітряна тривога!\n{FormatAlertLevel(state.Level)}\n" +
-              $"Регіон: {region}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ В області зафіксована тривога" : "🚨 Так, на локації є тривога!")}\n{FormatAlertLevel(state.Level)}\n" +
+              $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Пройди до укриття та стеж за офіційними повідомленнями.\n" +
+              (state.Scope == "область"
+                  ? "Статус міста окремо не підтверджений джерелом. Перевір місцеві офіційні повідомлення.\n"
+                  : "Пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\n" +
-              $"Регіон: {region}\n" +
+              $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
-              "Інформація може змінитися — перевіряй офіційні джерела.\n" +
+              (state.Scope == "область"
+                  ? "Джерело не передає статус міста окремо; перевір місцеві офіційні повідомлення.\n"
+                  : "Інформація може змінитися — перевіряй офіційні джерела.\n") +
               GetAlertsSourceText();
+    }
+
+    private static string GetAlertScopeText(AlertState state, Subscription subscription)
+    {
+        return state.Scope switch
+        {
+            "місто" => $"Місто/громада: {subscription.City}, {subscription.Region}",
+            "район" => $"Район: {subscription.District}, {subscription.Region}",
+            _ => $"Область: {subscription.Region} (місто окремо не перевірено)"
+        };
     }
 
     private static string GetAlertsSourceText()
     {
-        return Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri)
-            ? $"Дані: {uri.Host}"
-            : "Джерело: API статусів тривог";
+        if (!Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri))
+            return "Джерело: API статусів тривог";
+
+        string source = uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase)
+            ? "alerts.in.ua"
+            : uri.Host.Equals("jaam.net.ua", StringComparison.OrdinalIgnoreCase)
+                ? "JAAM (jaam.net.ua)"
+                : uri.Host;
+
+        return $"Дані: {source}";
     }
 
     private static string FormatAlertLevel(string level)
@@ -1715,5 +1895,6 @@ class Program
         bool IsAlert,
         String UpdatedAt,
         string Level = "",
-        bool HasData = true);
+        bool HasData = true,
+        string Scope = "область");
 }
