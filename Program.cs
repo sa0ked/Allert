@@ -1,8 +1,12 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -19,7 +23,8 @@ class Program
         "Одеська область", "Полтавська область", "Рівненська область",
         "Сумська область", "Тернопільська область", "Харківська область",
         "Херсонська область", "Хмельницька область", "Черкаська область",
-        "Чернівецька область", "Чернігівська область"
+        "Чернівецька область", "Чернігівська область",
+        "Луганська область", "Автономна Республіка Крим", "м. Київ"
     };
 
     private static readonly Dictionary<string, string[]> DistrictsByRegion = new()
@@ -46,6 +51,9 @@ class Program
         ["Черкаська область"] = new[] { "Звенигородський район", "Золотоніський район", "Уманський район", "Черкаський район" },
         ["Чернівецька область"] = new[] { "Вижницький район", "Дністровський район", "Чернівецький район" },
         ["Чернігівська область"] = new[] { "Корюківський район", "Ніжинський район", "Новгород-Сіверський район", "Прилуцький район", "Чернігівський район" },
+        ["Луганська область"] = new[] { "Алчевський район", "Луганський район", "Сєвєродонецький район", "Старобільський район", "Щастинський район" },
+        ["Автономна Республіка Крим"] = new[] { "Бахчисарайський район", "Джанкойський район", "Сімферопольський район", "Феодосійський район", "Ялтинський район" },
+        ["м. Київ"] = new[] { "Київ" },
         ["Харківська область"] = new[]
         {
             "Богодухівський район", "Ізюмський район", "Куп'янський район",
@@ -161,6 +169,17 @@ class Program
         ["Прилуцький район"] = new[] { "Прилуки", "Ічня", "Ладан" },
         ["Чернігівський район"] = new[] { "Чернігів", "Батурин", "Козелець" },
 
+        ["Алчевський район"] = new[] { "Алчевськ", "Брянка", "Кадіївка" },
+        ["Луганський район"] = new[] { "Луганськ", "Олександрівськ", "Хрящувате" },
+        ["Сєвєродонецький район"] = new[] { "Сєвєродонецьк", "Лисичанськ", "Рубіжне" },
+        ["Старобільський район"] = new[] { "Старобільськ", "Мілове", "Біловодськ" },
+        ["Щастинський район"] = new[] { "Щастя", "Новоайдар", "Станиця Луганська" },
+        ["Бахчисарайський район"] = new[] { "Бахчисарай", "Куйбишеве" },
+        ["Джанкойський район"] = new[] { "Джанкой", "Армянськ", "Красноперекопськ" },
+        ["Сімферопольський район"] = new[] { "Сімферополь", "Алушта", "Євпаторія" },
+        ["Феодосійський район"] = new[] { "Феодосія", "Керч", "Судак" },
+        ["Ялтинський район"] = new[] { "Ялта", "Севастополь", "Алупка" },
+        ["Київ"] = new[] { "Київ" },
         ["Ізюмський район"] = new[] { "Ізюм", "Барвінкове", "Борова", "Донецьке", "Балаклія" },
         ["Харківський район"] = new[] { "Харків", "Дергачі", "Люботин", "Мерефа", "Південне" },
         ["Богодухівський район"] = new[] { "Богодухів", "Валки", "Краснокутськ" },
@@ -256,11 +275,16 @@ class Program
         }
     }
 
-    private static readonly Dictionary<long, Subscription> Subscriptions = new();
-    private static readonly Dictionary<long, int> StatusPresses = new();
-    private static readonly Dictionary<long, string> PendingRegions = new();
-    private static readonly Dictionary<long, string> PendingDistricts = new();
-    private static readonly HashSet<long> AwaitingDistrictText = new();
+    private static readonly ConcurrentDictionary<long, Subscription> Subscriptions = new();
+    private static readonly ConcurrentDictionary<long, int> StatusPresses = new();
+    private static readonly ConcurrentDictionary<long, string> PendingRegions = new();
+    private static readonly ConcurrentDictionary<long, string> PendingDistricts = new();
+    private static readonly ConcurrentDictionary<long, byte> AwaitingDistrictText = new();
+    private static readonly ConcurrentDictionary<long, byte> BannedUsers = new();
+    private static readonly ConcurrentDictionary<long, byte> DroneOptOut = new();
+    private static readonly ConcurrentDictionary<long, DateTimeOffset> LastDroneNotify = new();
+    private static readonly List<DroneReport> DroneReports = new();
+    private static readonly DateTimeOffset StartedAt = DateTimeOffset.UtcNow;
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
     private static readonly List<AlertHistoryEntry> AlertHistory = new();
     private static readonly SemaphoreSlim AlertsJsonLock = new(1, 1);
@@ -277,11 +301,29 @@ class Program
     // Список администраторов бота
     private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
 
-    private static readonly string? AlertsHistoryToken =
-        Environment.GetEnvironmentVariable("ALERTS_HISTORY_TOKEN");
+    private const string KeyedAlertsUrl = "https://api.alerts.in.ua/v1/alerts/active.json";
 
+    private static readonly string? AlertsHistoryToken =
+        Environment.GetEnvironmentVariable("ALERTS_HISTORY_TOKEN")?.Trim();
+
+    // Ключ API берём ТОЛЬКО из переменной окружения (не хардкодим в коде/репозитории).
     private static readonly string? AlertsApiToken =
-        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN") ?? AlertsHistoryToken;
+        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN")?.Trim() ?? AlertsHistoryToken;
+
+    private static readonly HashSet<long> AdminIds =
+        ParseLongList(Environment.GetEnvironmentVariable("ADMIN_IDS"));
+
+    // Каналы-мониторинги, из которых бот принимает посты про БпЛА (бот должен быть админом канала).
+    private static readonly HashSet<long> DroneChannelIds =
+        ParseLongList(Environment.GetEnvironmentVariable("DRONE_CHANNEL_IDS"));
+
+    private static readonly string[] DroneKeywords =
+        { "шахед", "бпла", "дрон", "герань", "безпілот", "мопед", "shahed", "geran" };
+
+    private static readonly string[] DroneClearKeywords = { "відбій", "відбой" };
+
+    private static readonly Regex ExplicitOffsetRegex =
+        new(@"(Z|[+\-]\d{2}(:?\d{2})?)\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly string DataFilePath = ResolveDataFilePath();
 
@@ -289,7 +331,9 @@ class Program
         Path.Combine(AppContext.BaseDirectory, "bot-update.json");
 
     private static readonly string UpdateVersionPath =
-        Path.Combine(AppContext.BaseDirectory, "bot-update-version.txt");
+        Path.Combine(
+            Path.GetDirectoryName(DataFilePath) ?? AppContext.BaseDirectory,
+            "bot-update-version.txt");
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -301,7 +345,9 @@ class Program
     private static readonly object DataLock = new();
     private static readonly TimeZoneInfo KyivTimeZone = GetKyivTimeZone();
 
-    private static readonly string AlertsUrl = DefaultAlertsUrl;
+    private static readonly string AlertsUrl = ResolveAlertsUrl();
+
+    private static string ActiveSourceUrl = AlertsUrl;
 
     private static readonly string? UpdatesUrl =
         Environment.GetEnvironmentVariable("UPDATES_URL");
@@ -326,8 +372,9 @@ class Program
         User me = await Bot.GetMe();
 
         Console.WriteLine($"Бот @{me.Username} запущен.");
-        Console.WriteLine($"Источник статусов: {AlertsUrl}");
-        Console.WriteLine($"API истории: {(string.IsNullOrWhiteSpace(AlertsHistoryToken) ? "не настроен" : "настроен")}");
+        Console.WriteLine($"Джерело статусів: {AlertsUrl}");
+        Console.WriteLine($"API ключ: {(string.IsNullOrWhiteSpace(AlertsApiToken) ? "не налаштований" : "налаштований")}");
+        Console.WriteLine($"Канали БпЛА: {DroneChannelIds.Count}; ID адмінів: {AdminIds.Count}");
 
         using CancellationTokenSource cts = new();
 
@@ -339,7 +386,7 @@ class Program
 
         ReceiverOptions options = new()
         {
-            AllowedUpdates = Array.Empty<UpdateType>()
+            AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery, UpdateType.ChannelPost }
         };
 
         Task polling = Bot.ReceiveAsync(HandleUpdateAsync, HandleErrorAsync, options, cts.Token);
@@ -361,7 +408,13 @@ class Program
 
     private static bool IsAdmin(Message message)
     {
-        if (message.From?.Username == null)
+        if (message.From is null)
+            return false;
+
+        if (AdminIds.Contains(message.From.Id))
+            return true;
+
+        if (message.From.Username == null)
             return false;
 
         return AdminUsernames.Contains(message.From.Username, StringComparer.OrdinalIgnoreCase);
@@ -369,14 +422,14 @@ class Program
 
     private static async Task SendAdminInfoAsync(long chatId, CancellationToken ct)
     {
-        string adminsList = string.Join("\n", AdminUsernames.Select(username => $"• @{username}"));
-        
-        string text = 
-            "👑 **Інформація про адміністраторів бота:**\n\n" +
+        string adminsList = string.Join("\n", AdminUsernames.Select(username => $"• @{WebUtility.HtmlEncode(username)}"));
+
+        string text =
+            "👑 <b>Інформація про адміністраторів бота:</b>\n\n" +
             adminsList + "\n\n" +
             "З усіх питань роботи бота або пропозицій ви можете звертатися до них! 🫶";
 
-        await Bot.SendMessage(chatId, text, parseMode: ParseMode.Markdown, cancellationToken: ct);
+        await Bot.SendMessage(chatId, text, parseMode: ParseMode.Html, cancellationToken: ct);
     }
 
     private static async Task SendMaintenanceMessageAsync(string? customText = null)
@@ -390,16 +443,57 @@ class Program
             ? defaultText
             : $"🔧 {customText}";
 
+        await SendToAllAsync(text, CancellationToken.None);
+    }
+
+    private static async Task<int> SendToAllAsync(string text, CancellationToken ct)
+    {
+        int sent = 0;
+
         foreach (long chatId in Subscriptions.Keys.ToArray())
         {
-            try
+            if (BannedUsers.ContainsKey(chatId))
+                continue;
+
+            if (await SafeSendAsync(chatId, text, ct))
+                sent++;
+
+            await Task.Delay(40, CancellationToken.None);
+        }
+
+        return sent;
+    }
+
+    /// <summary>Безпечна відправка: не падає, а блокування бота користувачем (403) прибирає підписку.</summary>
+    private static async Task<bool> SafeSendAsync(
+        long chatId,
+        string text,
+        CancellationToken ct,
+        ParseMode parseMode = default)
+    {
+        try
+        {
+            await Bot.SendMessage(chatId, text, parseMode: parseMode, cancellationToken: ct);
+            return true;
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 403)
+        {
+            if (Subscriptions.TryRemove(chatId, out _))
             {
-                await Bot.SendMessage(chatId, text);
+                Console.WriteLine($"Користувач {chatId} заблокував бота — підписку видалено.");
+                SaveSubscriptions();
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Не вдалося надіслати повідомлення в чат {chatId}: {ex.Message}");
-            }
+
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не вдалося надіслати повідомлення в чат {chatId}: {ex.Message}");
+            return false;
         }
     }
 
@@ -541,6 +635,30 @@ class Program
         File.WriteAllText(UpdateVersionPath, version);
     }
 
+    private static string ResolveAlertsUrl()
+    {
+        string? custom = Environment.GetEnvironmentVariable("ALERTS_URL")?.Trim();
+        if (!string.IsNullOrWhiteSpace(custom))
+            return custom;
+
+        return string.IsNullOrWhiteSpace(AlertsApiToken) ? DefaultAlertsUrl : KeyedAlertsUrl;
+    }
+
+    private static HashSet<long> ParseLongList(string? value)
+    {
+        HashSet<long> result = new();
+        if (string.IsNullOrWhiteSpace(value))
+            return result;
+
+        foreach (string part in value.Split(new[] { ',', ';', ' ', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (long.TryParse(part.Trim(), out long id))
+                result.Add(id);
+        }
+
+        return result;
+    }
+
     private static string ResolveDataFilePath()
     {
         string? configuredPath = Environment.GetEnvironmentVariable("BOT_DATA_FILE");
@@ -564,6 +682,9 @@ class Program
         {
             string json = File.ReadAllText(DataFilePath);
 
+            if (string.IsNullOrWhiteSpace(json))
+                return;
+
             using JsonDocument document = JsonDocument.Parse(json);
             List<PersistedSubscription>? saved;
 
@@ -578,6 +699,9 @@ class Program
                 saved = root.TryGetProperty("subscriptions", out JsonElement subscriptions)
                     ? JsonSerializer.Deserialize<List<PersistedSubscription>>(subscriptions.GetRawText(), JsonOptions)
                     : new List<PersistedSubscription>();
+
+                LoadIdSet(root, "bannedUsers", BannedUsers);
+                LoadIdSet(root, "droneOptOut", DroneOptOut);
 
                 if (root.TryGetProperty("alertHistory", out JsonElement history) &&
                     history.ValueKind == JsonValueKind.Array)
@@ -613,6 +737,19 @@ class Program
         }
     }
 
+    private static void LoadIdSet(JsonElement root, string property, ConcurrentDictionary<long, byte> target)
+    {
+        if (!root.TryGetProperty(property, out JsonElement array) ||
+            array.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (JsonElement item in array.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.Number && item.TryGetInt64(out long id))
+                target[id] = 0;
+        }
+    }
+
     private static void SaveSubscriptions()
     {
         try
@@ -625,7 +762,9 @@ class Program
                         item.Value.Region,
                         item.Value.City,
                         item.Value.District)).ToList(),
-                    AlertHistory.ToList());
+                    AlertHistory.ToList(),
+                    BannedUsers.Keys.ToList(),
+                    DroneOptOut.Keys.ToList());
 
                 string temporaryPath = DataFilePath + ".tmp";
 
@@ -656,6 +795,13 @@ class Program
                 return;
             }
 
+            if (update.Type == UpdateType.ChannelPost &&
+                update.ChannelPost is not null)
+            {
+                await HandleChannelPostAsync(update.ChannelPost, ct);
+                return;
+            }
+
             if (update.Type != UpdateType.Message ||
                 update.Message?.Text is null)
             {
@@ -664,7 +810,13 @@ class Program
 
             Message message = update.Message;
             long chatId = message.Chat.Id;
-            string text = message.Text.Trim();
+            string text = NormalizeCommand(message.Text.Trim());
+
+            if (BannedUsers.ContainsKey(chatId) && !IsAdmin(message))
+                return;
+
+            if (await TryHandleAdminCommandAsync(message, text, ct))
+                return;
 
             if (text.Equals("/start", StringComparison.OrdinalIgnoreCase))
             {
@@ -673,60 +825,52 @@ class Program
             }
             else if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
-                await SendHelpAsync(chatId, ct);
+                await SendHelpAsync(chatId, IsAdmin(message), ct);
             }
             else if (text.Equals("ℹ️ Інфо", StringComparison.OrdinalIgnoreCase) || text.Equals("/admin", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendAdminInfoAsync(chatId, ct);
             }
             else if (text.Equals("/status", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses[chatId] = StatusPresses.GetValueOrDefault(chatId) + 1;
+                StatusPresses.AddOrUpdate(chatId, 1, (_, value) => value + 1);
                 await SendStatusAsync(chatId, ct);
             }
             else if (text.Equals("🔄 Оновити", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("/refresh", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendAlarmStatusAsync(chatId, ct);
             }
             else if (text.Equals("📍 Моя підписка", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("/subscription", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendSubscriptionInfoAsync(chatId, ct);
             }
             else if (text.Equals("/alarm", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("Є тривога?", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendAlarmStatusAsync(chatId, ct);
             }
             else if (text.Equals("Історія", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("/history", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendCityHistoryAsync(chatId, ct);
             }
             else if (text.Equals("/updates", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
                 await SendBotUpdateAsync(ct, chatId);
             }
-            else if (text.Equals("/dadadaf", StringComparison.OrdinalIgnoreCase))
+            else if (text.StartsWith("/drones", StringComparison.OrdinalIgnoreCase) ||
+                     text.Equals("🛩 БпЛА поруч", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
-                if (!IsAdmin(message))
-                {
-                    await bot.SendMessage(
-                        chatId,
-                        "⛔ Ця команда доступна лише адміністратору.",
-                        cancellationToken: ct);
-                    return;
-                }
-
-                await SendRegisteredUsersAsync(chatId, ct);
+                StatusPresses.TryRemove(chatId, out _);
+                await HandleDronesCommandAsync(chatId, text, ct);
             }
             else if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase) ||
                      text.Equals("Скасувати", StringComparison.OrdinalIgnoreCase))
@@ -738,34 +882,13 @@ class Program
                     replyMarkup: GetStatusKeyboard(),
                     cancellationToken: ct);
             }
-            else if (text.StartsWith("/maintenance", StringComparison.OrdinalIgnoreCase))
-            {
-                if (!IsAdmin(message))
-                {
-                    await bot.SendMessage(
-                        chatId,
-                        "Ця команда доступна лише адміністратору.",
-                        cancellationToken: ct);
-                    return;
-                }
-
-                string customText = text["/maintenance".Length..].Trim();
-
-                await SendMaintenanceMessageAsync(
-                    string.IsNullOrWhiteSpace(customText) ? null : customText);
-
-                await bot.SendMessage(
-                    chatId,
-                    "Повідомлення про технічні роботи надіслано підписникам.",
-                    cancellationToken: ct);
-            }
             else if (text.Equals("/stop", StringComparison.OrdinalIgnoreCase))
             {
-                StatusPresses.Remove(chatId);
-                Subscriptions.Remove(chatId, out _);
-                PendingRegions.Remove(chatId);
-                PendingDistricts.Remove(chatId);
-                AwaitingDistrictText.Remove(chatId);
+                StatusPresses.TryRemove(chatId, out _);
+                Subscriptions.TryRemove(chatId, out _);
+                PendingRegions.TryRemove(chatId, out _);
+                PendingDistricts.TryRemove(chatId, out _);
+                AwaitingDistrictText.TryRemove(chatId, out _);
 
                 SaveSubscriptions();
 
@@ -775,7 +898,7 @@ class Program
                     replyMarkup: GetStatusKeyboard(),
                     cancellationToken: ct);
             }
-            else if (AwaitingDistrictText.Remove(chatId))
+            else if (AwaitingDistrictText.TryRemove(chatId, out _))
             {
                 PendingDistricts[chatId] = text;
 
@@ -792,8 +915,8 @@ class Program
 
                 Subscriptions[chatId] = new Subscription(region, city, district);
 
-                PendingRegions.Remove(chatId);
-                PendingDistricts.Remove(chatId);
+                PendingRegions.TryRemove(chatId, out _);
+                PendingDistricts.TryRemove(chatId, out _);
 
                 SaveSubscriptions();
 
@@ -819,7 +942,7 @@ class Program
                         "Напиши назву свого району одним повідомленням:",
                         cancellationToken: ct);
 
-                    AwaitingDistrictText.Add(chatId);
+                    AwaitingDistrictText[chatId] = 0;
                 }
             }
             else
@@ -836,11 +959,29 @@ class Program
         }
     }
 
+    private const string ManualCityButton = "Введу місто вручну";
+
+    private static string NormalizeCommand(string text)
+    {
+        if (!text.StartsWith('/'))
+            return text;
+
+        int split = text.IndexOfAny(new[] { ' ', '\n', '\t' });
+        string command = split < 0 ? text : text[..split];
+        string rest = split < 0 ? "" : text[split..];
+
+        int at = command.IndexOf('@');
+        if (at > 0)
+            command = command[..at];
+
+        return command + rest;
+    }
+
     private static void ClearPendingSetup(long chatId)
     {
-        PendingRegions.Remove(chatId);
-        PendingDistricts.Remove(chatId);
-        AwaitingDistrictText.Remove(chatId);
+        PendingRegions.TryRemove(chatId, out _);
+        PendingDistricts.TryRemove(chatId, out _);
+        AwaitingDistrictText.TryRemove(chatId, out _);
     }
 
     private static async Task SendSubscriptionInfoAsync(long chatId, CancellationToken ct)
@@ -863,37 +1004,40 @@ class Program
             cancellationToken: ct);
     }
 
-    private static async Task SendRegisteredUsersAsync(long chatId, CancellationToken ct)
+    private static async Task SendRegisteredUsersAsync(long chatId, string filter, CancellationToken ct)
     {
         KeyValuePair<long, Subscription>[] users = Subscriptions
+            .Where(item => string.IsNullOrWhiteSpace(filter) ||
+                           item.Value.Region.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                           item.Value.District.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                           item.Value.City.Contains(filter, StringComparison.OrdinalIgnoreCase))
             .OrderBy(item => item.Value.Region, StringComparer.OrdinalIgnoreCase)
             .ThenBy(item => item.Value.City, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
         if (users.Length == 0)
         {
-            await Bot.SendMessage(chatId, "Зареєстрованих підписок поки немає.", cancellationToken: ct);
+            await Bot.SendMessage(chatId, "Підписок за цим запитом немає.", cancellationToken: ct);
             return;
         }
 
         const int maxMessageLength = 3500;
-        string header = $"👥 Зареєстровані підписки: {users.Length}\n\n";
-        List<string> lines = new();
-        foreach ((long id, Subscription subscription) in users)
-        {
-            lines.Add($"• ID {id} — {subscription.City}, {subscription.District}, {subscription.Region}");
-        }
+        string header = $"👥 Зареєстровані підписки: {users.Length}" +
+                        (string.IsNullOrWhiteSpace(filter) ? "" : $" (фільтр: {filter})") + "\n\n";
 
         string chunk = header;
-        foreach (string line in lines)
+        foreach ((long id, Subscription subscription) in users)
         {
-            if (chunk.Length + line.Length + Environment.NewLine.Length > maxMessageLength)
+            string line = $"• ID {id} — {subscription.City}, {subscription.District}, {subscription.Region}" +
+                          (DroneOptOut.ContainsKey(id) ? " 🔕" : "");
+
+            if (chunk.Length + line.Length + 1 > maxMessageLength)
             {
                 await Bot.SendMessage(chatId, chunk, cancellationToken: ct);
                 chunk = "👥 Продовження списку\n\n";
             }
 
-            chunk += line + Environment.NewLine;
+            chunk += line + "\n";
         }
 
         if (!string.IsNullOrWhiteSpace(chunk))
@@ -912,6 +1056,9 @@ class Program
         long chatId = query.Message.Chat.Id;
         string data = query.Data;
 
+        if (BannedUsers.ContainsKey(chatId))
+            return;
+
         if (data.StartsWith("region:", StringComparison.Ordinal))
         {
             string region = data["region:".Length..];
@@ -928,13 +1075,16 @@ class Program
                     $"Обрана область: {region}. Напиши назву свого району:",
                     cancellationToken: ct);
 
-                AwaitingDistrictText.Add(chatId);
+                AwaitingDistrictText[chatId] = 0;
             }
         }
         else if (data.StartsWith("district:", StringComparison.Ordinal))
         {
             if (!PendingRegions.TryGetValue(chatId, out string? region))
+            {
+                await Bot.SendMessage(chatId, "Сесія вибору застаріла. Натисни /start і обери область ще раз.", cancellationToken: ct);
                 return;
+            }
 
             string district = data["district:".Length..];
             PendingDistricts[chatId] = district;
@@ -945,14 +1095,23 @@ class Program
         {
             if (!PendingRegions.TryGetValue(chatId, out string? region) ||
                 !PendingDistricts.TryGetValue(chatId, out string? district))
+            {
+                await Bot.SendMessage(chatId, "Сесія вибору застаріла. Натисни /start і обери область ще раз.", cancellationToken: ct);
                 return;
+            }
 
             string city = data["city:".Length..];
 
+            if (city == ManualCityButton)
+            {
+                await Bot.SendMessage(chatId, "Напиши назву свого міста одним повідомленням:", cancellationToken: ct);
+                return;
+            }
+
             Subscriptions[chatId] = new Subscription(region, city, district);
 
-            PendingRegions.Remove(chatId);
-            PendingDistricts.Remove(chatId);
+            PendingRegions.TryRemove(chatId, out _);
+            PendingDistricts.TryRemove(chatId, out _);
 
             SaveSubscriptions();
 
@@ -993,7 +1152,7 @@ class Program
     {
         string[] cities = CitiesByDistrict.TryGetValue(district, out string[]? knownCities)
             ? knownCities
-            : new[] { "Введу місто вручну" };
+            : new[] { ManualCityButton };
 
         InlineKeyboardButton[][] rows = cities
             .Select(city => new[]
@@ -1028,29 +1187,47 @@ class Program
             cancellationToken: ct);
     }
 
-    private static Task SendHelpAsync(long chatId, CancellationToken ct)
+    private static Task SendHelpAsync(long chatId, bool isAdmin, CancellationToken ct)
     {
-        return Bot.SendMessage(
-            chatId,
+        string text =
             "/start — вибрати область і місто\n" +
             "/status — поточний статус\n" +
             "/refresh — оновити статус зараз\n" +
             "/alarm — є тривога?\n" +
+            "/drones — БпЛА поруч (on/off — сповіщення)\n" +
             "/subscription — моя підписка\n" +
             "/cancel — скасувати налаштування\n" +
             "/history — історія тривог\n" +
             "/updates — останні оновлення\n" +
             "ℹ️ Інфо — інформація про адмінів\n" +
             "/help — допомога\n\n" +
-            "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.",
-            cancellationToken: ct);
+            "Рівні небезпеки: 🔴 червоний — тривога у твоєму місті, 🟡 жовтий — тривога/БпЛА в районі чи області, 🟢 зелений — спокійно.\n\n" +
+            "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.";
+
+        if (isAdmin)
+            text += "\n\n" + AdminHelpText;
+
+        return Bot.SendMessage(chatId, text, cancellationToken: ct);
     }
+
+    private const string AdminHelpText =
+        "👑 Команди адміністратора:\n" +
+        "/stats — статистика бота\n" +
+        "/users [фільтр] — список підписок (за областю/містом)\n" +
+        "/broadcast <текст> — розсилка всім підписникам\n" +
+        "/maintenance [текст] — повідомлення про техроботи\n" +
+        "/sendto <id> <текст> — написати користувачу\n" +
+        "/userinfo <id> — інформація про користувача\n" +
+        "/ban <id> · /unban <id> · /banned — блокування\n" +
+        "/drone <текст> — ручне повідомлення про БпЛА (піде тим, хто поруч)\n" +
+        "/export — вивантажити bot-data.json\n" +
+        "/adminhelp — ця довідка";
 
     private static ReplyKeyboardMarkup GetStatusKeyboard() => new(new[]
     {
         new KeyboardButton[] { "🔄 Оновити", "Є тривога?", "Історія" },
         new KeyboardButton[] { "📍 Моя підписка", "/status", "ℹ️ Інфо" },
-        new KeyboardButton[] { "/stop" }
+        new KeyboardButton[] { "🛩 БпЛА поруч", "/stop" }
     })
     {
         ResizeKeyboard = true,
@@ -1159,13 +1336,38 @@ class Program
             return;
         }
 
-        AlertState state = await GetAlertStateAsync(subscription, ct);
+        AlertState? state = await TryGetAlertStateAsync(chatId, subscription, ct);
+        if (state is null)
+            return;
 
         await Bot.SendMessage(
             chatId,
-            FormatAlarmStatus(state, subscription),
+            FormatAlarmStatus(state, subscription) + GetDroneSuffix(subscription),
             replyMarkup: GetStatusKeyboard(),
             cancellationToken: ct);
+    }
+
+    private static async Task<AlertState?> TryGetAlertStateAsync(
+        long chatId,
+        Subscription subscription,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await GetAlertStateAsync(subscription, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            Console.WriteLine($"Не вдалося отримати статус: {ex.Message}");
+
+            await Bot.SendMessage(
+                chatId,
+                "⚠️ Джерело даних про тривоги тимчасово недоступне. Спробуй ще раз за хвилину та перевір офіційні джерела.",
+                replyMarkup: GetStatusKeyboard(),
+                cancellationToken: ct);
+
+            return null;
+        }
     }
 
     private static async Task SendStatusAsync(long chatId, CancellationToken ct)
@@ -1179,12 +1381,15 @@ class Program
             return;
         }
 
-        AlertState state = await GetAlertStateAsync(subscription, ct);
-        int presses = StatusPresses.GetValueOrDefault(chatId);
+        AlertState? state = await TryGetAlertStateAsync(chatId, subscription, ct);
+        if (state is null)
+            return;
+
+        StatusPresses.TryGetValue(chatId, out int presses);
 
         if (presses >= 10)
         {
-            StatusPresses.Remove(chatId);
+            StatusPresses.TryRemove(chatId, out _);
 
             await Bot.SendMessage(
                 chatId,
@@ -1196,7 +1401,7 @@ class Program
 
         await Bot.SendMessage(
             chatId,
-            FormatAlert(state, subscription),
+            FormatAlert(state, subscription) + GetDroneSuffix(subscription),
             replyMarkup: GetStatusKeyboard(),
             cancellationToken: ct);
     }
@@ -1205,50 +1410,81 @@ class Program
     {
         while (!ct.IsCancellationRequested)
         {
-            foreach (IGrouping<string, KeyValuePair<long, Subscription>> group
-                     in Subscriptions.GroupBy(x => GetSubscriptionStateKey(x.Value)))
+            try
             {
-                try
+                foreach (IGrouping<string, KeyValuePair<long, Subscription>> group
+                         in Subscriptions.ToArray().GroupBy(x => GetSubscriptionStateKey(x.Value)))
                 {
-                    Subscription subscription = group.First().Value;
-                    AlertState state = await GetAlertStateAsync(subscription, ct);
-                    string stateKey = GetSubscriptionStateKey(subscription);
-
-                    if (!state.HasData)
-                        continue;
-
-                    if (!LastStates.TryGetValue(stateKey, out AlertState? previous))
+                    try
                     {
-                        LastStates[stateKey] = state;
-                        ReconcileHistoryOnStartup(stateKey, subscription, state);
-                        continue;
-                    }
+                        Subscription subscription = group.First().Value;
+                        AlertState state = await GetAlertStateAsync(subscription, ct);
+                        string stateKey = GetSubscriptionStateKey(subscription);
 
-                    if (previous.IsAlert != state.IsAlert)
-                    {
-                        LastStates[stateKey] = state;
-                        RecordAlertTransition(stateKey, subscription, state);
+                        if (!state.HasData)
+                            continue;
 
-                        foreach (KeyValuePair<long, Subscription> item in group)
+                        if (!LastStates.TryGetValue(stateKey, out AlertState? previous))
                         {
-                            await Bot.SendMessage(
+                            LastStates[stateKey] = state;
+                            ReconcileHistoryOnStartup(stateKey, subscription, state);
+                            continue;
+                        }
+
+                        bool changed = previous.IsAlert != state.IsAlert;
+                        bool escalated = !changed && state.IsAlert &&
+                                         !string.Equals(previous.Scope, state.Scope, StringComparison.Ordinal);
+
+                        LastStates[stateKey] = state;
+
+                        if (changed)
+                            RecordAlertTransition(stateKey, subscription, state);
+
+                        if (!changed && !escalated)
+                            continue;
+
+                        string prefix = escalated ? "⬆️ Рівень небезпеки змінився\n" : "";
+
+                        foreach (KeyValuePair<long, Subscription> item in group.ToArray())
+                        {
+                            if (BannedUsers.ContainsKey(item.Key))
+                                continue;
+
+                            await SafeSendAsync(
                                 item.Key,
-                                FormatAlert(state, item.Value),
-                                cancellationToken: ct);
+                                prefix + FormatAlert(state, item.Value) + GetDroneSuffix(item.Value),
+                                ct);
+
+                            await Task.Delay(40, ct);
                         }
                     }
-                    else
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
-                        LastStates[stateKey] = state;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Джерело тривог недоступне: {ex.Message}");
                     }
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Джерело тривог недоступне: {ex.Message}");
-                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Помилка циклу тривог: {ex.Message}");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
         }
     }
 
@@ -1335,37 +1571,39 @@ class Program
 
     private static DateTimeOffset GetHistoryTimestamp(string sourceTime)
     {
-        if (!string.IsNullOrWhiteSpace(sourceTime))
+        return TryParseSourceTime(sourceTime, out DateTimeOffset timestamp)
+            ? timestamp
+            : DateTimeOffset.UtcNow;
+    }
+
+    /// <summary>
+    /// Єдиний парсер часу джерела: якщо є зсув (Z, +02:00) — використовуємо його,
+    /// якщо часу без зони — вважаємо, що це київський час. Повертає UTC.
+    /// </summary>
+    private static bool TryParseSourceTime(string? value, out DateTimeOffset result)
+    {
+        result = default;
+
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        value = value.Trim();
+
+        if (value.Contains(':') && ExplicitOffsetRegex.IsMatch(value) &&
+            DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTimeOffset withOffset))
         {
-            int timeSeparator = sourceTime.IndexOf('T');
-            if (timeSeparator < 0)
-                timeSeparator = sourceTime.IndexOf(' ');
-
-            bool hasExplicitOffset = sourceTime.EndsWith("Z", StringComparison.OrdinalIgnoreCase) ||
-                sourceTime.Contains('+') ||
-                (timeSeparator >= 0 && sourceTime.LastIndexOf('-') > timeSeparator);
-
-            if (hasExplicitOffset && DateTimeOffset.TryParse(
-                    sourceTime,
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AllowWhiteSpaces,
-                    out DateTimeOffset timestamp))
-            {
-                return timestamp.ToUniversalTime();
-            }
-
-            if (DateTime.TryParse(sourceTime, CultureInfo.InvariantCulture,
-                    DateTimeStyles.AllowWhiteSpaces, out DateTime localTime))
-            {
-                if (localTime.Kind == DateTimeKind.Utc)
-                    return new DateTimeOffset(localTime);
-
-                DateTime unspecified = DateTime.SpecifyKind(localTime, DateTimeKind.Unspecified);
-                return new DateTimeOffset(unspecified, KyivTimeZone.GetUtcOffset(unspecified)).ToUniversalTime();
-            }
+            result = withOffset.ToUniversalTime();
+            return true;
         }
 
-        return DateTimeOffset.UtcNow;
+        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out DateTime local))
+        {
+            DateTime unspecified = DateTime.SpecifyKind(local, DateTimeKind.Unspecified);
+            result = new DateTimeOffset(unspecified, KyivTimeZone.GetUtcOffset(unspecified)).ToUniversalTime();
+            return true;
+        }
+
+        return false;
     }
 
     private static void TrimAlertHistory()
@@ -1392,11 +1630,8 @@ class Program
 
     private static string GetSubscriptionStateKey(Subscription subscription)
     {
-        if (Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri) &&
-            uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase))
-        {
+        if (IsAlertsInUa(ActiveSourceUrl))
             return $"{subscription.Region}|{subscription.District}|{subscription.City}";
-        }
 
         return subscription.Region;
     }
@@ -1615,6 +1850,12 @@ class Program
         return new string(normalized.Where(char.IsLetterOrDigit).ToArray());
     }
 
+    private static bool IsAlertsInUa(string url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) &&
+               uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<string> GetAlertsJsonAsync(CancellationToken ct)
     {
         await AlertsJsonLock.WaitAsync(ct);
@@ -1626,19 +1867,39 @@ class Program
                 return CachedAlertsJson;
             }
 
-            using HttpRequestMessage request = new(HttpMethod.Get, AlertsUrl);
-            if (!string.IsNullOrWhiteSpace(AlertsApiToken) &&
-                Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? alertsUri) &&
-                alertsUri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase))
+            // Основне джерело (з ключем), а якщо воно лягло / ключ не підійшов — резервне без ключа.
+            List<string> urls = new() { AlertsUrl };
+            if (!AlertsUrl.Equals(DefaultAlertsUrl, StringComparison.OrdinalIgnoreCase))
+                urls.Add(DefaultAlertsUrl);
+
+            Exception? lastError = null;
+
+            foreach (string url in urls)
             {
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AlertsApiToken);
+                try
+                {
+                    using HttpRequestMessage request = new(HttpMethod.Get, url);
+
+                    if (!string.IsNullOrWhiteSpace(AlertsApiToken) && IsAlertsInUa(url))
+                        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AlertsApiToken);
+
+                    using HttpResponseMessage response = await Http.SendAsync(request, ct);
+                    response.EnsureSuccessStatusCode();
+
+                    CachedAlertsJson = await response.Content.ReadAsStringAsync(ct);
+                    AlertsJsonFetchedAt = DateTimeOffset.UtcNow;
+                    ActiveSourceUrl = url;
+                    return CachedAlertsJson;
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    lastError = ex;
+                    string host = Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ? uri.Host : url;
+                    Console.WriteLine($"Джерело {host} недоступне: {ex.Message}");
+                }
             }
 
-            using HttpResponseMessage response = await Http.SendAsync(request, ct);
-            response.EnsureSuccessStatusCode();
-            CachedAlertsJson = await response.Content.ReadAsStringAsync(ct);
-            AlertsJsonFetchedAt = DateTimeOffset.UtcNow;
-            return CachedAlertsJson;
+            throw lastError ?? new InvalidOperationException("Немає доступного джерела тривог.");
         }
         finally
         {
@@ -1708,7 +1969,7 @@ class Program
         string place = GetAlertScopeText(state, subscription);
 
         return state.IsAlert
-            ? $"{(state.Scope == "область" ? "⚠️ ТРИВОГА В ОБЛАСТІ" : "🚨 ТРИВОГА")}\n{FormatAlertLevel(state.Level)}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ ТРИВОГА В ОБЛАСТІ" : "🚨 ТРИВОГА")}\n{FormatAlertLevel(state)}\n" +
               $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -1717,6 +1978,7 @@ class Program
                   : "Негайно пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Відбій повітряної тривоги\n" +
+              $"{FormatAlertLevel(state)}\n" +
               $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -1740,7 +2002,7 @@ class Program
         string place = GetAlertScopeText(state, subscription);
 
         return state.IsAlert
-            ? $"{(state.Scope == "область" ? "⚠️ В області зафіксована тривога" : "🚨 Так, на локації є тривога!")}\n{FormatAlertLevel(state.Level)}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ В області зафіксована тривога" : "🚨 Так, на локації є тривога!")}\n{FormatAlertLevel(state)}\n" +
               $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -1749,6 +2011,7 @@ class Program
                   : "Пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\n" +
+              $"{FormatAlertLevel(state)}\n" +
               $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -1770,7 +2033,7 @@ class Program
 
     private static string GetAlertsSourceText()
     {
-        if (!Uri.TryCreate(AlertsUrl, UriKind.Absolute, out Uri? uri))
+        if (!Uri.TryCreate(ActiveSourceUrl, UriKind.Absolute, out Uri? uri))
             return "Джерело: API статусів тривог";
 
         string source = uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase)
@@ -1784,8 +2047,26 @@ class Program
         return $"Дані: {source}";
     }
 
-    private static string FormatAlertLevel(string level)
+    /// <summary>Рівень небезпеки: 🔴 червоний — тривога у твоєму місті; 🟡 жовтий — у районі/області; 🟢 зелений — спокійно.</summary>
+    private static string FormatAlertLevel(AlertState state)
     {
+        string? fromSource = FormatSourceLevel(state.Level);
+        if (fromSource is not null)
+            return fromSource;
+
+        if (!state.IsAlert)
+            return "🟢 ЗЕЛЕНИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривоги немає";
+
+        return state.Scope == "місто"
+            ? "🔴 ЧЕРВОНИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривога саме у твоєму місті/громаді"
+            : "🟡 ЖОВТИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривога в районі/області, у твоєму місті окремо не підтверджена";
+    }
+
+    private static string? FormatSourceLevel(string level)
+    {
+        if (string.IsNullOrWhiteSpace(level))
+            return null;
+
         if (level.Contains("помаранч", StringComparison.OrdinalIgnoreCase) ||
             level.Contains("оранж", StringComparison.OrdinalIgnoreCase) ||
             level.Contains("orange", StringComparison.OrdinalIgnoreCase))
@@ -1808,9 +2089,7 @@ class Program
             level.Contains("critical", StringComparison.OrdinalIgnoreCase))
             return "🔴 ВИСОКИЙ РІВЕНЬ НЕБЕЗПЕКИ";
 
-        return string.IsNullOrWhiteSpace(level)
-            ? "⚠️ РІВЕНЬ НЕ ВКАЗАНО ДЖЕРЕЛОМ"
-            : $"⚠️ РІВЕНЬ НЕБЕЗПЕКИ: {level}";
+        return null;
     }
 
     private static string FormatTime(string value)
@@ -1818,26 +2097,13 @@ class Program
         if (string.IsNullOrWhiteSpace(value))
             return "невідомий (джерело не передало час)";
 
-        if (DateTime.TryParse(
-                value,
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AllowWhiteSpaces,
-                out DateTime date))
-        {
-            if (date.Year <= 1971)
-                return "невідомий (джерело передало технічну дату)";
+        if (!TryParseSourceTime(value, out DateTimeOffset moment))
+            return value;
 
-            DateTime kyivTime = DateTime.SpecifyKind(
-                date,
-                DateTimeKind.Unspecified);
+        if (moment.Year <= 1971)
+            return "невідомий (джерело передало технічну дату)";
 
-            TimeSpan offset = KyivTimeZone.GetUtcOffset(kyivTime);
-            DateTimeOffset exactKyivTime = new(kyivTime, offset);
-
-            return $"{exactKyivTime:dd.MM.yyyy HH:mm:ss} (Київ)";
-        }
-
-        return value;
+        return $"{TimeZoneInfo.ConvertTime(moment, KyivTimeZone):dd.MM.yyyy HH:mm:ss} (Київ)";
     }
 
     private static string FormatUpdateTime(string value)
@@ -1859,7 +2125,7 @@ class Program
 
     private static string FormatDuration(string value)
     {
-        if (!TryParseAlertTime(value, out DateTimeOffset startedAt) ||
+        if (!TryParseSourceTime(value, out DateTimeOffset startedAt) ||
             startedAt.Year <= 1971)
         {
             return "невідомо (джерело не передало коректний час)";
@@ -1909,6 +2175,622 @@ class Program
         }
     }
 
+    // ======================= БпЛА / шахеди поруч =======================
+
+    private static string Truncate(string value, int max)
+    {
+        return value.Length <= max ? value : value[..max].TrimEnd() + "…";
+    }
+
+    private static string FormatClock(DateTimeOffset moment)
+    {
+        return TimeZoneInfo.ConvertTime(moment, KyivTimeZone).ToString("HH:mm");
+    }
+
+    private static async Task HandleChannelPostAsync(Message post, CancellationToken ct)
+    {
+        string? text = post.Text ?? post.Caption;
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        long channelId = post.Chat.Id;
+
+        // Тільки канали зі списку: інакше будь-хто зміг би додати бота у свій канал і розсилати фейки.
+        if (!DroneChannelIds.Contains(channelId))
+        {
+            Console.WriteLine(
+                $"Пост із каналу {channelId} ({post.Chat.Title}) проігноровано. " +
+                "Щоб приймати такі пости — додай цей ID у змінну DRONE_CHANNEL_IDS.");
+            return;
+        }
+
+        await ProcessDroneReportAsync(text, post.Chat.Title ?? "канал моніторингу", ct);
+    }
+
+    private static bool IsDroneText(string text)
+    {
+        string lower = text.ToLowerInvariant();
+        return DroneKeywords.Any(keyword => lower.Contains(keyword));
+    }
+
+    private static async Task<int> ProcessDroneReportAsync(string text, string source, CancellationToken ct)
+    {
+        if (!IsDroneText(text))
+            return 0;
+
+        string lower = text.ToLowerInvariant();
+        if (DroneClearKeywords.Any(keyword => lower.Contains(keyword)))
+            return 0;
+
+        lock (DataLock)
+        {
+            DroneReports.Add(new DroneReport(DateTimeOffset.UtcNow, Truncate(text.Trim(), 400), source));
+            DroneReports.RemoveAll(item => DateTimeOffset.UtcNow - item.At > TimeSpan.FromHours(3));
+
+            if (DroneReports.Count > 200)
+                DroneReports.RemoveRange(0, DroneReports.Count - 200);
+        }
+
+        int sent = 0;
+
+        foreach (KeyValuePair<long, Subscription> item in Subscriptions.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
+
+            long chatId = item.Key;
+            if (BannedUsers.ContainsKey(chatId) || DroneOptOut.ContainsKey(chatId))
+                continue;
+
+            string? scope = MatchDroneScope(text, item.Value);
+            if (scope is null)
+                continue;
+
+            if (LastDroneNotify.TryGetValue(chatId, out DateTimeOffset last) &&
+                DateTimeOffset.UtcNow - last < TimeSpan.FromMinutes(2))
+                continue;
+
+            LastDroneNotify[chatId] = DateTimeOffset.UtcNow;
+
+            if (await SafeSendAsync(chatId, FormatDroneAlert(scope, item.Value, text, source), ct))
+                sent++;
+
+            await Task.Delay(40, ct);
+        }
+
+        return sent;
+    }
+
+    private static string FormatDroneAlert(string scope, Subscription subscription, string text, string source)
+    {
+        string header = scope switch
+        {
+            "місто" => $"🔴 ЧЕРВОНИЙ РІВЕНЬ — БпЛА поруч із містом {subscription.City}!",
+            "район" => $"🟡 ЖОВТИЙ РІВЕНЬ — БпЛА у твоєму районі: {subscription.District}",
+            _ => $"🟡 ЖОВТИЙ РІВЕНЬ — БпЛА в області: {subscription.Region}"
+        };
+
+        return header + "\n\n" +
+               $"🛩 «{Truncate(text.Trim(), 350)}»\n\n" +
+               $"Джерело: {source} (неофіційні дані, можливі неточності).\n" +
+               $"Твоя локація: {subscription.City}, {subscription.District}.\n" +
+               "Слідкуй за офіційними повідомленнями; при оголошенні тривоги — негайно в укриття.\n\n" +
+               "Вимкнути такі сповіщення: /drones off";
+    }
+
+    private static string[] SplitWords(string text)
+    {
+        string cleaned = text.ToLowerInvariant()
+            .Replace("'", "")
+            .Replace("’", "")
+            .Replace("ʼ", "");
+
+        return Regex.Split(cleaned, @"[^\p{L}\p{N}]+")
+            .Where(word => word.Length > 0)
+            .ToArray();
+    }
+
+    private static bool ContainsPlace(string[] words, IEnumerable<string> roots, int maxTail)
+    {
+        string[] rootList = roots.Where(root => root.Length >= 3).Distinct().ToArray();
+
+        for (int i = 0; i < words.Length; i++)
+        {
+            string candidate = "";
+
+            for (int span = 0; span < 3 && i + span < words.Length; span++)
+            {
+                candidate += words[i + span];
+
+                foreach (string root in rootList)
+                {
+                    if (candidate.StartsWith(root, StringComparison.Ordinal) &&
+                        candidate.Length - root.Length <= maxTail)
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> GetDroneCityRoots(string city)
+    {
+        if (city.Length < 4)
+            yield break;
+
+        foreach (string root in GetCityNameRoots(city))
+            yield return root;
+
+        if (city.EndsWith("ів", StringComparison.Ordinal))
+            yield return city[..^2] + "ов";
+
+        if (city == "київ")
+            yield return "києв";
+    }
+
+    /// <summary>Повертає "місто" / "район" / "область", якщо текст про БпЛА стосується локації підписника.</summary>
+    private static string? MatchDroneScope(string text, Subscription subscription)
+    {
+        string[] words = SplitWords(text);
+        if (words.Length == 0)
+            return null;
+
+        // 1) місто / громада. "Харківщина" або "Харківська" не вважаються містом: хвіст слова ≤ 3 літер.
+        string city = NormalizeLocationName(subscription.City);
+        if (ContainsPlace(words, GetDroneCityRoots(city), 3))
+            return "місто";
+
+        // 2) район
+        string district = NormalizeLocationName(subscription.District);
+        if (district.Length >= 6 && district.EndsWith("ий", StringComparison.Ordinal))
+        {
+            string baseStem = district[..^2];
+            string[] forms = { baseStem + "ий", baseStem + "ого", baseStem + "ому", baseStem + "им", baseStem + "ім" };
+
+            if (words.Any(word => forms.Contains(word)))
+                return "район";
+
+            if (district.EndsWith("ький", StringComparison.Ordinal) && district.Length > 8)
+            {
+                string core = district[..^5];
+                if (core.Length >= 3 && words.Any(word => word.StartsWith(core + "щин", StringComparison.Ordinal)))
+                    return "район";
+            }
+        }
+
+        // 3) область ("Харківщина", "Харківська область", "на Харківщині")
+        if (subscription.Region.EndsWith("область", StringComparison.OrdinalIgnoreCase))
+        {
+            string adjective = subscription.Region
+                .Split(' ')[0]
+                .Split('-')
+                .Last()
+                .ToLowerInvariant()
+                .Replace("'", "");
+
+            string stem = adjective;
+            foreach (string ending in new[] { "ська", "цька", "зька" })
+            {
+                if (adjective.EndsWith(ending, StringComparison.Ordinal))
+                {
+                    stem = adjective[..^ending.Length];
+                    break;
+                }
+            }
+
+            if (stem.Length >= 3 &&
+                words.Any(word => word.StartsWith(stem, StringComparison.Ordinal) && word.Length - stem.Length >= 4))
+                return "область";
+        }
+
+        return null;
+    }
+
+    private static List<DroneMatch> GetRecentDroneReports(Subscription subscription, int minutes)
+    {
+        List<DroneReport> snapshot;
+        lock (DataLock)
+        {
+            snapshot = DroneReports.ToList();
+        }
+
+        DateTimeOffset threshold = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(minutes);
+        List<DroneMatch> result = new();
+
+        foreach (DroneReport report in snapshot.Where(item => item.At >= threshold).OrderByDescending(item => item.At))
+        {
+            string? scope = MatchDroneScope(report.Text, subscription);
+            if (scope is not null)
+                result.Add(new DroneMatch(report.At, scope, report.Text));
+        }
+
+        return result;
+    }
+
+    private static string GetDroneSuffix(Subscription subscription)
+    {
+        List<DroneMatch> recent = GetRecentDroneReports(subscription, 30);
+        if (recent.Count == 0)
+            return "";
+
+        string level = recent.Any(item => item.Scope == "місто") ? "🔴 червоний" : "🟡 жовтий";
+
+        StringBuilder builder = new();
+        builder.Append($"\n\n🛩 За останні 30 хв були повідомлення про БпЛА поруч ({level} рівень за БпЛА):");
+
+        foreach (DroneMatch item in recent.Take(2))
+            builder.Append($"\n• {FormatClock(item.At)} — {Truncate(item.Text.Replace('\n', ' '), 120)}");
+
+        builder.Append("\n(неофіційні дані)");
+        return builder.ToString();
+    }
+
+    private static async Task HandleDronesCommandAsync(long chatId, string text, CancellationToken ct)
+    {
+        string arg = text.StartsWith('/')
+            ? text.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault()?.Trim().ToLowerInvariant() ?? ""
+            : "";
+
+        if (arg is "off" or "вимк")
+        {
+            DroneOptOut[chatId] = 0;
+            SaveSubscriptions();
+
+            await Bot.SendMessage(
+                chatId,
+                "🔕 Сповіщення про БпЛА поруч вимкнено. Звичайні сповіщення про тривоги працюють як раніше. Увімкнути: /drones on",
+                replyMarkup: GetStatusKeyboard(),
+                cancellationToken: ct);
+            return;
+        }
+
+        if (arg is "on" or "увімк")
+        {
+            DroneOptOut.TryRemove(chatId, out _);
+            SaveSubscriptions();
+
+            await Bot.SendMessage(
+                chatId,
+                "🛩 Сповіщення про БпЛА поруч із твоєю локацією увімкнено.",
+                replyMarkup: GetStatusKeyboard(),
+                cancellationToken: ct);
+            return;
+        }
+
+        if (!Subscriptions.TryGetValue(chatId, out Subscription? subscription))
+        {
+            await Bot.SendMessage(
+                chatId,
+                "Спочатку обери область і місто через /start.",
+                cancellationToken: ct);
+            return;
+        }
+
+        List<DroneMatch> recent = GetRecentDroneReports(subscription, 60);
+        bool enabled = !DroneOptOut.ContainsKey(chatId);
+
+        StringBuilder builder = new();
+        builder.AppendLine($"🛩 БпЛА поруч — {subscription.City}");
+        builder.AppendLine($"Сповіщення: {(enabled ? "увімкнені ✅" : "вимкнені 🔕")} (змінити: /drones {(enabled ? "off" : "on")})");
+        builder.AppendLine();
+
+        if (recent.Count == 0)
+        {
+            builder.AppendLine("🟢 За останню годину повідомлень про БпЛА поруч із твоєю локацією немає.");
+        }
+        else
+        {
+            builder.AppendLine(recent.Any(item => item.Scope == "місто")
+                ? "🔴 ЧЕРВОНИЙ РІВЕНЬ — є повідомлення про БпЛА поруч із твоїм містом:"
+                : "🟡 ЖОВТИЙ РІВЕНЬ — є повідомлення про БпЛА в районі/області:");
+
+            foreach (DroneMatch item in recent.Take(5))
+            {
+                string label = item.Scope switch
+                {
+                    "місто" => "місто",
+                    "район" => "район",
+                    _ => "область"
+                };
+
+                builder.AppendLine($"• {FormatClock(item.At)} [{label}] {Truncate(item.Text.Replace('\n', ' '), 160)}");
+            }
+        }
+
+        builder.AppendLine();
+        builder.AppendLine(DroneChannelIds.Count == 0
+            ? "ℹ️ Автоматичний моніторинг каналів не підключений — дані з'являються з повідомлень адміністраторів."
+            : "Дані беруться з каналів моніторингу.");
+        builder.Append("Це неофіційна інформація — завжди слідкуй за офіційними джерелами.");
+
+        await Bot.SendMessage(chatId, builder.ToString(), replyMarkup: GetStatusKeyboard(), cancellationToken: ct);
+    }
+
+    // ======================= Адмін-команди =======================
+
+    private static readonly HashSet<string> AdminCommands = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "/adminhelp", "/stats", "/users", "/dadadaf", "/broadcast", "/maintenance",
+        "/sendto", "/ban", "/unban", "/banned", "/userinfo", "/drone", "/export"
+    };
+
+    private static async Task<bool> TryHandleAdminCommandAsync(Message message, string text, CancellationToken ct)
+    {
+        if (!text.StartsWith('/'))
+            return false;
+
+        int split = text.IndexOfAny(new[] { ' ', '\n', '\t' });
+        string command = (split < 0 ? text : text[..split]).ToLowerInvariant();
+        string args = split < 0 ? "" : text[(split + 1)..].Trim();
+
+        if (!AdminCommands.Contains(command))
+            return false;
+
+        long chatId = message.Chat.Id;
+        StatusPresses.TryRemove(chatId, out _);
+
+        if (!IsAdmin(message))
+        {
+            await Bot.SendMessage(chatId, "⛔ Ця команда доступна лише адміністратору.", cancellationToken: ct);
+            return true;
+        }
+
+        switch (command)
+        {
+            case "/adminhelp":
+                await Bot.SendMessage(chatId, AdminHelpText, cancellationToken: ct);
+                break;
+
+            case "/stats":
+                await SendAdminStatsAsync(chatId, ct);
+                break;
+
+            case "/users":
+            case "/dadadaf":
+                await SendRegisteredUsersAsync(chatId, args, ct);
+                break;
+
+            case "/broadcast":
+            {
+                if (string.IsNullOrWhiteSpace(args))
+                {
+                    await Bot.SendMessage(chatId, "Використання: /broadcast <текст>", cancellationToken: ct);
+                    break;
+                }
+
+                await Bot.SendMessage(chatId, $"⏳ Розсилку запущено ({Subscriptions.Count} підписок).", cancellationToken: ct);
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        int sent = await SendToAllAsync($"📢 {args}", ct);
+                        await Bot.SendMessage(chatId, $"✅ Розсилку завершено. Доставлено: {sent}.", cancellationToken: ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Помилка розсилки: {ex.Message}");
+                    }
+                });
+                break;
+            }
+
+            case "/maintenance":
+            {
+                await Bot.SendMessage(chatId, "⏳ Повідомлення про технічні роботи розсилається підписникам.", cancellationToken: ct);
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await SendMaintenanceMessageAsync(string.IsNullOrWhiteSpace(args) ? null : args);
+                        await Bot.SendMessage(chatId, "✅ Повідомлення про технічні роботи надіслано.", cancellationToken: ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Помилка розсилки: {ex.Message}");
+                    }
+                });
+                break;
+            }
+
+            case "/sendto":
+            {
+                string[] parts = args.Split(new[] { ' ', '\n' }, 2, StringSplitOptions.RemoveEmptyEntries);
+
+                if (parts.Length < 2 || !long.TryParse(parts[0], out long targetId))
+                {
+                    await Bot.SendMessage(chatId, "Використання: /sendto <id> <текст>", cancellationToken: ct);
+                    break;
+                }
+
+                bool ok = await SafeSendAsync(targetId, $"💬 Повідомлення від адміністратора:\n\n{parts[1]}", ct);
+
+                await Bot.SendMessage(
+                    chatId,
+                    ok ? "✅ Надіслано." : "❌ Не вдалося надіслати (користувач заблокував бота або ID невірний).",
+                    cancellationToken: ct);
+                break;
+            }
+
+            case "/ban":
+            case "/unban":
+            {
+                if (!long.TryParse(args.Split(' ')[0], out long targetId))
+                {
+                    await Bot.SendMessage(chatId, $"Використання: {command} <id>", cancellationToken: ct);
+                    break;
+                }
+
+                if (command == "/ban")
+                {
+                    if (targetId == chatId)
+                    {
+                        await Bot.SendMessage(chatId, "Себе банити не можна 🙂", cancellationToken: ct);
+                        break;
+                    }
+
+                    BannedUsers[targetId] = 0;
+                    Subscriptions.TryRemove(targetId, out _);
+                    SaveSubscriptions();
+
+                    await Bot.SendMessage(chatId, $"⛔ Користувача {targetId} заблоковано, підписку видалено.", cancellationToken: ct);
+                }
+                else
+                {
+                    BannedUsers.TryRemove(targetId, out _);
+                    SaveSubscriptions();
+
+                    await Bot.SendMessage(chatId, $"✅ Користувача {targetId} розблоковано.", cancellationToken: ct);
+                }
+
+                break;
+            }
+
+            case "/banned":
+            {
+                long[] banned = BannedUsers.Keys.ToArray();
+
+                await Bot.SendMessage(
+                    chatId,
+                    banned.Length == 0
+                        ? "Заблокованих користувачів немає."
+                        : "⛔ Заблоковані:\n" + string.Join("\n", banned.Select(id => $"• {id}")),
+                    cancellationToken: ct);
+                break;
+            }
+
+            case "/userinfo":
+            {
+                if (!long.TryParse(args, out long targetId))
+                {
+                    await Bot.SendMessage(chatId, "Використання: /userinfo <id>", cancellationToken: ct);
+                    break;
+                }
+
+                string subscriptionText = Subscriptions.TryGetValue(targetId, out Subscription? target)
+                    ? $"{target.City}, {target.District}, {target.Region}"
+                    : "немає підписки";
+
+                await Bot.SendMessage(
+                    chatId,
+                    $"👤 ID {targetId}\n" +
+                    $"Підписка: {subscriptionText}\n" +
+                    $"Сповіщення про БпЛА: {(DroneOptOut.ContainsKey(targetId) ? "вимкнені" : "увімкнені")}\n" +
+                    $"Заблокований: {(BannedUsers.ContainsKey(targetId) ? "так" : "ні")}",
+                    cancellationToken: ct);
+                break;
+            }
+
+            case "/drone":
+            {
+                if (string.IsNullOrWhiteSpace(args))
+                {
+                    await Bot.SendMessage(
+                        chatId,
+                        "Використання: /drone <текст>\nНаприклад: /drone Шахед курсом на Балаклію, Харківщина",
+                        cancellationToken: ct);
+                    break;
+                }
+
+                if (!IsDroneText(args))
+                {
+                    await Bot.SendMessage(
+                        chatId,
+                        "Текст має містити слово «шахед», «БпЛА», «дрон» тощо, щоб бот зрозумів, що це повідомлення про БпЛА.",
+                        cancellationToken: ct);
+                    break;
+                }
+
+                int notified = await ProcessDroneReportAsync(args, "адміністратор", ct);
+
+                await Bot.SendMessage(
+                    chatId,
+                    $"🛩 Повідомлення збережено. Надіслано підписникам поруч: {notified}.",
+                    cancellationToken: ct);
+                break;
+            }
+
+            case "/export":
+            {
+                SaveSubscriptions();
+
+                if (!File.Exists(DataFilePath))
+                {
+                    await Bot.SendMessage(chatId, "Файл даних ще не створено.", cancellationToken: ct);
+                    break;
+                }
+
+                await using FileStream stream = new(DataFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+                await Bot.SendDocument(
+                    chatId,
+                    InputFile.FromStream(stream, "bot-data.json"),
+                    caption: "📦 Резервна копія bot-data.json",
+                    cancellationToken: ct);
+                break;
+            }
+        }
+
+        return true;
+    }
+
+    private static async Task SendAdminStatsAsync(long chatId, CancellationToken ct)
+    {
+        KeyValuePair<long, Subscription>[] users = Subscriptions.ToArray();
+
+        int historyCount;
+        int openAlerts;
+        int droneReports;
+
+        lock (DataLock)
+        {
+            historyCount = AlertHistory.Count;
+            openAlerts = AlertHistory.Count(item => !item.FinishedAt.HasValue);
+            droneReports = DroneReports.Count;
+        }
+
+        string topRegions = string.Join("\n", users
+            .GroupBy(item => item.Value.Region)
+            .OrderByDescending(group => group.Count())
+            .Take(5)
+            .Select(group => $"• {group.Key}: {group.Count()}"));
+
+        string topCities = string.Join("\n", users
+            .GroupBy(item => item.Value.City)
+            .OrderByDescending(group => group.Count())
+            .Take(5)
+            .Select(group => $"• {group.Key}: {group.Count()}"));
+
+        StringBuilder builder = new();
+        builder.AppendLine("📊 Статистика бота");
+        builder.AppendLine($"⏱ Працює: {FormatHistoryDuration(DateTimeOffset.UtcNow - StartedAt)}");
+        builder.AppendLine($"👥 Підписок: {users.Length} (міст: {users.Select(item => item.Value.City).Distinct().Count()})");
+        builder.AppendLine($"🔕 БпЛА-сповіщення вимкнено: {DroneOptOut.Count}");
+        builder.AppendLine($"⛔ Заблоковано: {BannedUsers.Count}");
+        builder.AppendLine($"📚 Записів історії: {historyCount} (відкритих тривог: {openAlerts})");
+        builder.AppendLine($"🛩 Повідомлень про БпЛА (за 3 год): {droneReports}; каналів: {DroneChannelIds.Count}");
+        builder.AppendLine($"🌐 {GetAlertsSourceText()}");
+
+        if (users.Length > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("Топ областей:");
+            builder.AppendLine(topRegions);
+            builder.AppendLine();
+            builder.AppendLine("Топ міст:");
+            builder.Append(topCities);
+        }
+
+        await Bot.SendMessage(chatId, builder.ToString(), cancellationToken: ct);
+    }
+
     private static Task HandleErrorAsync(
         ITelegramBotClient _,
         Exception exception,
@@ -1931,7 +2813,13 @@ class Program
 
     private sealed record PersistedBotData(
         List<PersistedSubscription> Subscriptions,
-        List<AlertHistoryEntry> AlertHistory);
+        List<AlertHistoryEntry> AlertHistory,
+        List<long>? BannedUsers = null,
+        List<long>? DroneOptOut = null);
+
+    private sealed record DroneReport(DateTimeOffset At, string Text, string Source);
+
+    private sealed record DroneMatch(DateTimeOffset At, string Scope, string Text);
 
     private sealed record AlertHistoryEntry(
         string StateKey,
