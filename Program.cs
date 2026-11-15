@@ -301,6 +301,9 @@ class Program
     // Список администраторов бота
     private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
 
+    // Ключ прямо в коді (змінна ALERTS_API_TOKEN, якщо задана, має пріоритет).
+    private const string EmbeddedAlertsApiToken = "d0cdc3ed:3246f9142e41bc0b3702ba9ada3bfd65";
+
     private const string KeyedAlertsUrl = "https://api.alerts.in.ua/v1/alerts/active.json";
 
     private static readonly string? AlertsHistoryToken =
@@ -308,7 +311,7 @@ class Program
 
     // Ключ API берём ТОЛЬКО из переменной окружения (не хардкодим в коде/репозитории).
     private static readonly string? AlertsApiToken =
-        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN")?.Trim() ?? AlertsHistoryToken;
+        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN")?.Trim() ?? AlertsHistoryToken ?? EmbeddedAlertsApiToken;
 
     private static readonly HashSet<long> AdminIds =
         ParseLongList(Environment.GetEnvironmentVariable("ADMIN_IDS"));
