@@ -1460,7 +1460,8 @@ class Program
 
                         bool changed = previous.IsAlert != state.IsAlert;
                         bool escalated = !changed && state.IsAlert &&
-                                         !string.Equals(previous.Scope, state.Scope, StringComparison.Ordinal);
+                                         (!string.Equals(previous.Scope, state.Scope, StringComparison.Ordinal) ||
+                                          ApiLevelToThreat(previous.Level) != ApiLevelToThreat(state.Level));
 
                         LastStates[stateKey] = state;
 
@@ -1801,6 +1802,7 @@ class Program
     {
         string? bestScope = null;
         string bestTime = "";
+        string bestLevel = "";
 
         foreach (JsonElement region in root.EnumerateArray())
         {
@@ -1809,6 +1811,7 @@ class Program
 
             // Беремо лише повітряні тривоги (AIR); артилерія / вуличні бої / хімія не рахуються.
             string since = "";
+            string levelName = "";
             bool hasAir = false;
 
             if (region.TryGetProperty("activeAlerts", out JsonElement active) &&
@@ -1821,6 +1824,19 @@ class Program
 
                     hasAir = true;
                     since = ReadString(alert, "lastUpdate");
+
+                    // Офіційний рівень небезпеки: activeAlertLevels[].alertLevel (Red / Yellow ...).
+                    if (alert.TryGetProperty("activeAlertLevels", out JsonElement levels) &&
+                        levels.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (JsonElement levelItem in levels.EnumerateArray())
+                        {
+                            string candidate = ReadString(levelItem, "alertLevel");
+                            if (ApiLevelToThreat(candidate) > ApiLevelToThreat(levelName))
+                                levelName = candidate;
+                        }
+                    }
+
                     break;
                 }
             }
@@ -1848,16 +1864,38 @@ class Program
             if (scope == "область" && subscription.Region.StartsWith("м. Київ", StringComparison.OrdinalIgnoreCase))
                 scope = "місто";
 
-            if (bestScope is null || ScopeRank(scope) > ScopeRank(bestScope))
+            // Перемагає найточніша локація (місто > район > область); при рівності — вищий рівень.
+            if (bestScope is null ||
+                ScopeRank(scope) > ScopeRank(bestScope) ||
+                (ScopeRank(scope) == ScopeRank(bestScope) &&
+                 ApiLevelToThreat(levelName) > ApiLevelToThreat(bestLevel)))
             {
                 bestScope = scope;
                 bestTime = since;
+                bestLevel = levelName;
             }
         }
 
         return bestScope is null
             ? new AlertState(false, "", HasData: true, Scope: "місто")
-            : new AlertState(true, bestTime, "", Scope: bestScope);
+            : new AlertState(true, bestTime, bestLevel, Scope: bestScope);
+    }
+
+    /// <summary>Red → 🔴 ракети/масована атака, Yellow → 🟡 дрони (нова система рівнів тривог).</summary>
+    private static ThreatKind ApiLevelToThreat(string level)
+    {
+        if (string.IsNullOrWhiteSpace(level))
+            return ThreatKind.None;
+
+        if (level.Contains("red", StringComparison.OrdinalIgnoreCase) ||
+            level.Contains("червон", StringComparison.OrdinalIgnoreCase))
+            return ThreatKind.Missile;
+
+        if (level.Contains("yellow", StringComparison.OrdinalIgnoreCase) ||
+            level.Contains("жовт", StringComparison.OrdinalIgnoreCase))
+            return ThreatKind.Drone;
+
+        return ThreatKind.None;
     }
 
     private static int ScopeRank(string scope) => scope switch
@@ -2180,11 +2218,17 @@ class Program
         if (!state.IsAlert)
             return "🟢 ЗЕЛЕНИЙ РІВЕНЬ — тривоги немає";
 
-        return GetRecentThreat(subscription, 30) switch
+        // Рівень з API — основа; свіжі пости каналів можуть лише підвищити його (напр. жовтий → червоний).
+        ThreatKind threat = GetRecentThreat(subscription, 30);
+        ThreatKind fromApi = ApiLevelToThreat(state.Level);
+        if (fromApi > threat)
+            threat = fromApi;
+
+        return threat switch
         {
             ThreatKind.Missile => "🔴 ЧЕРВОНИЙ РІВЕНЬ — ракетна загроза / балістика",
             ThreatKind.Drone => "🟡 ЖОВТИЙ РІВЕНЬ — загроза БпЛА (дрони, реактивні, FPV)",
-            _ => "🚨 Повітряна тривога — тип загрози не уточнено (немає свіжих повідомлень моніторингу)"
+            _ => "🚨 Повітряна тривога — рівень загрози джерело не передало"
         };
     }
 
