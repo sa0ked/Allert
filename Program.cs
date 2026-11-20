@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
@@ -282,7 +282,7 @@ class Program
     private static readonly ConcurrentDictionary<long, byte> AwaitingDistrictText = new();
     private static readonly ConcurrentDictionary<long, byte> BannedUsers = new();
     private static readonly ConcurrentDictionary<long, byte> DroneOptOut = new();
-    private static readonly ConcurrentDictionary<long, DateTimeOffset> LastDroneNotify = new();
+    private static readonly ConcurrentDictionary<string, DateTimeOffset> LastDroneNotify = new();
     private static readonly List<DroneReport> DroneReports = new();
     private static readonly DateTimeOffset StartedAt = DateTimeOffset.UtcNow;
     private static readonly ConcurrentDictionary<string, AlertState> LastStates = new();
@@ -301,17 +301,20 @@ class Program
     // Список администраторов бота
     private static readonly string[] AdminUsernames = { "sa0ked", "kandes00" };
 
-    // Ключ прямо в коді (змінна ALERTS_API_TOKEN, якщо задана, має пріоритет).
-    private const string EmbeddedAlertsApiToken = "d0cdc3ed:3246f9142e41bc0b3702ba9ada3bfd65";
-
     private const string KeyedAlertsUrl = "https://api.alerts.in.ua/v1/alerts/active.json";
+
+    // Ukraine Alarm API (api.ukrainealarm.com). Ключ — ТІЛЬКИ зі змінної оточення UKRAINEALARM_API_KEY.
+    private const string UkraineAlarmUrl = "https://api.ukrainealarm.com/api/v3/alerts";
+
+    private static readonly string? UkraineAlarmToken =
+        Environment.GetEnvironmentVariable("UKRAINEALARM_API_KEY")?.Trim();
 
     private static readonly string? AlertsHistoryToken =
         Environment.GetEnvironmentVariable("ALERTS_HISTORY_TOKEN")?.Trim();
 
     // Ключ API берём ТОЛЬКО из переменной окружения (не хардкодим в коде/репозитории).
     private static readonly string? AlertsApiToken =
-        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN")?.Trim() ?? AlertsHistoryToken ?? EmbeddedAlertsApiToken;
+        Environment.GetEnvironmentVariable("ALERTS_API_TOKEN")?.Trim() ?? AlertsHistoryToken;
 
     private static readonly HashSet<long> AdminIds =
         ParseLongList(Environment.GetEnvironmentVariable("ADMIN_IDS"));
@@ -320,8 +323,25 @@ class Program
     private static readonly HashSet<long> DroneChannelIds =
         ParseLongList(Environment.GetEnvironmentVariable("DRONE_CHANNEL_IDS"));
 
+    // 🟡 ЖОВТИЙ рівень: дрони (ударні шахеди, реактивні, FPV, будь-які БпЛА).
     private static readonly string[] DroneKeywords =
-        { "шахед", "бпла", "дрон", "герань", "безпілот", "мопед", "shahed", "geran" };
+    {
+        "шахед", "бпла", "дрон", "герань", "геран", "безпілот", "мопед", "гербера",
+        "фпв", "fpv", "камікадзе", "shahed", "geran", "gerbera", "uav"
+    };
+
+    // 🔴 ЧЕРВОНИЙ рівень: ракети та балістика (перевіряється ПЕРШИМ — має пріоритет над дронами).
+    private static readonly string[] MissileKeywords =
+    {
+        "баліст", "ракет", "крилат", "кинджал", "кінжал", "іскандер", "калібр", "циркон",
+        "х-101", "х-22", "х-47", "х-59", "х-31", "x-101", "x-22", "x-47", "x-59", "x-31",
+        "кн-23", "kn-23", "iskander", "kinzhal", "kalibr", "zircon", "ballistic", "cruise missile"
+    };
+
+    // Реактивні дрони: "реактивний шахед", "реактивні дрони", "Герань-3" тощо.
+    private static readonly Regex JetDroneRegex = new(
+        @"реактивн\w*\s+(шахед|дрон|бпла|герань|геран|безпілот)|геран[ьи]?-?\s?3|geran-?\s?3|шахед-?\s?238",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly string[] DroneClearKeywords = { "відбій", "відбой" };
 
@@ -376,7 +396,8 @@ class Program
 
         Console.WriteLine($"Бот @{me.Username} запущен.");
         Console.WriteLine($"Джерело статусів: {AlertsUrl}");
-        Console.WriteLine($"API ключ: {(string.IsNullOrWhiteSpace(AlertsApiToken) ? "не налаштований" : "налаштований")}");
+        Console.WriteLine($"API ключ alerts.in.ua: {(string.IsNullOrWhiteSpace(AlertsApiToken) ? "не налаштований" : "налаштований")}");
+        Console.WriteLine($"API ключ ukrainealarm.com: {(string.IsNullOrWhiteSpace(UkraineAlarmToken) ? "не налаштований" : "налаштований")}");
         Console.WriteLine($"Канали БпЛА: {DroneChannelIds.Count}; ID адмінів: {AdminIds.Count}");
 
         using CancellationTokenSource cts = new();
@@ -643,6 +664,9 @@ class Program
         string? custom = Environment.GetEnvironmentVariable("ALERTS_URL")?.Trim();
         if (!string.IsNullOrWhiteSpace(custom))
             return custom;
+
+        if (!string.IsNullOrWhiteSpace(UkraineAlarmToken))
+            return UkraineAlarmUrl;
 
         return string.IsNullOrWhiteSpace(AlertsApiToken) ? DefaultAlertsUrl : KeyedAlertsUrl;
     }
@@ -1204,7 +1228,7 @@ class Program
             "/updates — останні оновлення\n" +
             "ℹ️ Інфо — інформація про адмінів\n" +
             "/help — допомога\n\n" +
-            "Рівні небезпеки: 🔴 червоний — тривога у твоєму місті, 🟡 жовтий — тривога/БпЛА в районі чи області, 🟢 зелений — спокійно.\n\n" +
+            "Рівні небезпеки: 🔴 червоний — ракети / балістика; 🟡 жовтий — дрони (ударні, реактивні, FPV); 🟢 зелений — спокійно.\n\n" +
             "Повідомлення можуть затримуватися. У небезпеці користуйся офіційними каналами цивільного захисту.";
 
         if (isAdmin)
@@ -1633,7 +1657,7 @@ class Program
 
     private static string GetSubscriptionStateKey(Subscription subscription)
     {
-        if (IsAlertsInUa(ActiveSourceUrl))
+        if (IsAlertsInUa(ActiveSourceUrl) || IsUkraineAlarm(ActiveSourceUrl))
             return $"{subscription.Region}|{subscription.District}|{subscription.City}";
 
         return subscription.Region;
@@ -1648,6 +1672,9 @@ class Program
         using JsonDocument document = JsonDocument.Parse(json);
 
         JsonElement root = document.RootElement;
+
+        if (IsUkraineAlarm(ActiveSourceUrl) && root.ValueKind == JsonValueKind.Array)
+            return ParseUkraineAlarm(root, subscription);
 
         JsonElement records =
             root.ValueKind == JsonValueKind.Object &&
@@ -1760,12 +1787,94 @@ class Program
     private static bool TryMatchActiveAlert(
         JsonElement alert,
         Subscription subscription,
+        out string scope) =>
+        TryMatchLocation(
+            ReadString(alert, "location_title", "location", "name"),
+            ReadString(alert, "location_type"),
+            ReadString(alert, "location_oblast"),
+            ReadString(alert, "location_raion"),
+            subscription,
+            out scope);
+
+    /// <summary>Розбір відповіді Ukraine Alarm API v3: масив регіонів з activeAlerts (State / District / Community).</summary>
+    private static AlertState ParseUkraineAlarm(JsonElement root, Subscription subscription)
+    {
+        string? bestScope = null;
+        string bestTime = "";
+
+        foreach (JsonElement region in root.EnumerateArray())
+        {
+            if (region.ValueKind != JsonValueKind.Object)
+                continue;
+
+            // Беремо лише повітряні тривоги (AIR); артилерія / вуличні бої / хімія не рахуються.
+            string since = "";
+            bool hasAir = false;
+
+            if (region.TryGetProperty("activeAlerts", out JsonElement active) &&
+                active.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement alert in active.EnumerateArray())
+                {
+                    if (!ReadString(alert, "type").Equals("AIR", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    hasAir = true;
+                    since = ReadString(alert, "lastUpdate");
+                    break;
+                }
+            }
+
+            if (!hasAir)
+                continue;
+
+            string name = ReadString(region, "regionName");
+            string kind = ReadString(region, "regionType");
+
+            string type = kind.ToLowerInvariant() switch
+            {
+                "state" => "oblast",
+                "district" => "raion",
+                "community" => "hromada",
+                _ => ""
+            };
+
+            // Для областей передаємо назву як oblast, щоб тривога чужої області не збігалась з нашою.
+            string oblast = type == "oblast" ? name : "";
+
+            if (!TryMatchLocation(name, type, oblast, "", subscription, out string scope))
+                continue;
+
+            if (scope == "область" && subscription.Region.StartsWith("м. Київ", StringComparison.OrdinalIgnoreCase))
+                scope = "місто";
+
+            if (bestScope is null || ScopeRank(scope) > ScopeRank(bestScope))
+            {
+                bestScope = scope;
+                bestTime = since;
+            }
+        }
+
+        return bestScope is null
+            ? new AlertState(false, "", HasData: true, Scope: "місто")
+            : new AlertState(true, bestTime, "", Scope: bestScope);
+    }
+
+    private static int ScopeRank(string scope) => scope switch
+    {
+        "місто" => 3,
+        "район" => 2,
+        _ => 1
+    };
+
+    private static bool TryMatchLocation(
+        string title,
+        string type,
+        string oblast,
+        string raion,
+        Subscription subscription,
         out string scope)
     {
-        string title = ReadString(alert, "location_title", "location", "name");
-        string type = ReadString(alert, "location_type");
-        string oblast = ReadString(alert, "location_oblast");
-        string raion = ReadString(alert, "location_raion");
 
         if (!string.IsNullOrWhiteSpace(oblast) &&
             !IsSameRegion(oblast, subscription.Region))
@@ -1853,6 +1962,12 @@ class Program
         return new string(normalized.Where(char.IsLetterOrDigit).ToArray());
     }
 
+    private static bool IsUkraineAlarm(string url)
+    {
+        return Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) &&
+               uri.Host.Equals("api.ukrainealarm.com", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsAlertsInUa(string url)
     {
         return Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) &&
@@ -1885,6 +2000,10 @@ class Program
 
                     if (!string.IsNullOrWhiteSpace(AlertsApiToken) && IsAlertsInUa(url))
                         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AlertsApiToken);
+
+                    // Ukraine Alarm: ключ передається в заголовку Authorization БЕЗ слова "Bearer".
+                    if (!string.IsNullOrWhiteSpace(UkraineAlarmToken) && IsUkraineAlarm(url))
+                        request.Headers.TryAddWithoutValidation("Authorization", UkraineAlarmToken);
 
                     using HttpResponseMessage response = await Http.SendAsync(request, ct);
                     response.EnsureSuccessStatusCode();
@@ -1972,7 +2091,7 @@ class Program
         string place = GetAlertScopeText(state, subscription);
 
         return state.IsAlert
-            ? $"{(state.Scope == "область" ? "⚠️ ТРИВОГА В ОБЛАСТІ" : "🚨 ТРИВОГА")}\n{FormatAlertLevel(state)}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ ТРИВОГА В ОБЛАСТІ" : "🚨 ТРИВОГА")}\n{FormatAlertLevel(state, subscription)}\n" +
               $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -1981,7 +2100,7 @@ class Program
                   : "Негайно пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Відбій повітряної тривоги\n" +
-              $"{FormatAlertLevel(state)}\n" +
+              $"{FormatAlertLevel(state, subscription)}\n" +
               $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -2005,7 +2124,7 @@ class Program
         string place = GetAlertScopeText(state, subscription);
 
         return state.IsAlert
-            ? $"{(state.Scope == "область" ? "⚠️ В області зафіксована тривога" : "🚨 Так, на локації є тривога!")}\n{FormatAlertLevel(state)}\n" +
+            ? $"{(state.Scope == "область" ? "⚠️ В області зафіксована тривога" : "🚨 Так, на локації є тривога!")}\n{FormatAlertLevel(state, subscription)}\n" +
               $"{place}\n" +
               $"Початок: {FormatTime(state.UpdatedAt)}\n" +
               $"Триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -2014,7 +2133,7 @@ class Program
                   : "Пройди до укриття та стеж за офіційними повідомленнями.\n") +
               GetAlertsSourceText()
             : $"✅ Зараз активної повітряної тривоги не зафіксовано.\n" +
-              $"{FormatAlertLevel(state)}\n" +
+              $"{FormatAlertLevel(state, subscription)}\n" +
               $"{place}\n" +
               $"Час відбою: {FormatTime(state.UpdatedAt)}\n" +
               $"Відбій триває: {FormatDuration(state.UpdatedAt)}\n\n" +
@@ -2039,7 +2158,9 @@ class Program
         if (!Uri.TryCreate(ActiveSourceUrl, UriKind.Absolute, out Uri? uri))
             return "Джерело: API статусів тривог";
 
-        string source = uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase)
+        string source = uri.Host.Equals("api.ukrainealarm.com", StringComparison.OrdinalIgnoreCase)
+            ? "Ukraine Alarm (ukrainealarm.com)"
+            : uri.Host.Equals("api.alerts.in.ua", StringComparison.OrdinalIgnoreCase)
             ? "alerts.in.ua"
             : uri.Host.Equals("ubilling.net.ua", StringComparison.OrdinalIgnoreCase)
                 ? "UBilling (статуси по областях)"
@@ -2050,19 +2171,21 @@ class Program
         return $"Дані: {source}";
     }
 
-    /// <summary>Рівень небезпеки: 🔴 червоний — тривога у твоєму місті; 🟡 жовтий — у районі/області; 🟢 зелений — спокійно.</summary>
-    private static string FormatAlertLevel(AlertState state)
+    /// <summary>
+    /// Рівні: 🔴 червоний — ракети / балістика; 🟡 жовтий — дрони (ударні, реактивні, FPV);
+    /// 🟢 зелений — тривоги немає. Тип загрози береться зі свіжих повідомлень каналів моніторингу.
+    /// </summary>
+    private static string FormatAlertLevel(AlertState state, Subscription subscription)
     {
-        string? fromSource = FormatSourceLevel(state.Level);
-        if (fromSource is not null)
-            return fromSource;
-
         if (!state.IsAlert)
-            return "🟢 ЗЕЛЕНИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривоги немає";
+            return "🟢 ЗЕЛЕНИЙ РІВЕНЬ — тривоги немає";
 
-        return state.Scope == "місто"
-            ? "🔴 ЧЕРВОНИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривога саме у твоєму місті/громаді"
-            : "🟡 ЖОВТИЙ РІВЕНЬ НЕБЕЗПЕКИ — тривога в районі/області, у твоєму місті окремо не підтверджена";
+        return GetRecentThreat(subscription, 30) switch
+        {
+            ThreatKind.Missile => "🔴 ЧЕРВОНИЙ РІВЕНЬ — ракетна загроза / балістика",
+            ThreatKind.Drone => "🟡 ЖОВТИЙ РІВЕНЬ — загроза БпЛА (дрони, реактивні, FPV)",
+            _ => "🚨 Повітряна тривога — тип загрози не уточнено (немає свіжих повідомлень моніторингу)"
+        };
     }
 
     private static string? FormatSourceLevel(string level)
@@ -2210,10 +2333,77 @@ class Program
         await ProcessDroneReportAsync(text, post.Chat.Title ?? "канал моніторингу", ct);
     }
 
-    private static bool IsDroneText(string text)
+    private enum ThreatKind { None = 0, Drone = 1, Missile = 2 }
+
+    private static ThreatKind ClassifyThreat(string text)
     {
         string lower = text.ToLowerInvariant();
-        return DroneKeywords.Any(keyword => lower.Contains(keyword));
+
+        if (MissileKeywords.Any(keyword => lower.Contains(keyword)))
+            return ThreatKind.Missile;
+
+        if (JetDroneRegex.IsMatch(lower) || DroneKeywords.Any(keyword => lower.Contains(keyword)))
+            return ThreatKind.Drone;
+
+        return ThreatKind.None;
+    }
+
+    private static bool IsDroneText(string text) => ClassifyThreat(text) != ThreatKind.None;
+
+    /// <summary>
+    /// Чи стосується повідомлення локації підписника та який там тип загрози.
+    /// Довгі пости ділимо на рядки/речення, щоб "ракети на Київщину" не давали червоний рівень харків'янам.
+    /// </summary>
+    private static bool TryMatchThreat(string text, Subscription subscription, out string scope, out ThreatKind threat)
+    {
+        scope = "";
+        threat = ThreatKind.None;
+
+        ThreatKind whole = ClassifyThreat(text);
+        if (whole == ThreatKind.None)
+            return false;
+
+        string? bestScope = null;
+        ThreatKind bestThreat = ThreatKind.None;
+
+        foreach (string segment in Regex.Split(text, @"[\r\n]+|(?<=[.!?;])\s+"))
+        {
+            if (string.IsNullOrWhiteSpace(segment))
+                continue;
+
+            string? segmentScope = MatchDroneScope(segment, subscription);
+            if (segmentScope is null)
+                continue;
+
+            ThreatKind segmentThreat = ClassifyThreat(segment);
+            if (segmentThreat == ThreatKind.None)
+                segmentThreat = whole;
+
+            if (bestScope is null || ScopeRank(segmentScope) > ScopeRank(bestScope))
+                bestScope = segmentScope;
+
+            if (segmentThreat > bestThreat)
+                bestThreat = segmentThreat;
+        }
+
+        if (bestScope is null)
+        {
+            bestScope = MatchDroneScope(text, subscription);
+            if (bestScope is null)
+                return false;
+
+            bestThreat = whole;
+        }
+
+        scope = bestScope;
+        threat = bestThreat;
+        return true;
+    }
+
+    private static ThreatKind GetRecentThreat(Subscription subscription, int minutes)
+    {
+        List<DroneMatch> recent = GetRecentDroneReports(subscription, minutes);
+        return recent.Count == 0 ? ThreatKind.None : recent.Max(item => item.Threat);
     }
 
     private static async Task<int> ProcessDroneReportAsync(string text, string source, CancellationToken ct)
@@ -2244,17 +2434,19 @@ class Program
             if (BannedUsers.ContainsKey(chatId) || DroneOptOut.ContainsKey(chatId))
                 continue;
 
-            string? scope = MatchDroneScope(text, item.Value);
-            if (scope is null)
+            if (!TryMatchThreat(text, item.Value, out string scope, out ThreatKind threat))
                 continue;
 
-            if (LastDroneNotify.TryGetValue(chatId, out DateTimeOffset last) &&
+            // Ліміт 2 хв окремо для жовтих і червоних, щоб червоний не губився за щойно надісланим жовтим.
+            string notifyKey = $"{chatId}:{(int)threat}";
+
+            if (LastDroneNotify.TryGetValue(notifyKey, out DateTimeOffset last) &&
                 DateTimeOffset.UtcNow - last < TimeSpan.FromMinutes(2))
                 continue;
 
-            LastDroneNotify[chatId] = DateTimeOffset.UtcNow;
+            LastDroneNotify[notifyKey] = DateTimeOffset.UtcNow;
 
-            if (await SafeSendAsync(chatId, FormatDroneAlert(scope, item.Value, text, source), ct))
+            if (await SafeSendAsync(chatId, FormatDroneAlert(scope, threat, item.Value, text, source), ct))
                 sent++;
 
             await Task.Delay(40, ct);
@@ -2263,17 +2455,26 @@ class Program
         return sent;
     }
 
-    private static string FormatDroneAlert(string scope, Subscription subscription, string text, string source)
+    private static string FormatDroneAlert(
+        string scope,
+        ThreatKind threat,
+        Subscription subscription,
+        string text,
+        string source)
     {
-        string header = scope switch
+        string place = scope switch
         {
-            "місто" => $"🔴 ЧЕРВОНИЙ РІВЕНЬ — БпЛА поруч із містом {subscription.City}!",
-            "район" => $"🟡 ЖОВТИЙ РІВЕНЬ — БпЛА у твоєму районі: {subscription.District}",
-            _ => $"🟡 ЖОВТИЙ РІВЕНЬ — БпЛА в області: {subscription.Region}"
+            "місто" => $"поруч із містом {subscription.City}",
+            "район" => $"у районі: {subscription.District}",
+            _ => $"в області: {subscription.Region}"
         };
 
+        string header = threat == ThreatKind.Missile
+            ? $"🔴 ЧЕРВОНИЙ РІВЕНЬ — ракетна загроза / балістика {place}!"
+            : $"🟡 ЖОВТИЙ РІВЕНЬ — загроза БпЛА (дрони, реактивні, FPV) {place}";
+
         return header + "\n\n" +
-               $"🛩 «{Truncate(text.Trim(), 350)}»\n\n" +
+               $"{(threat == ThreatKind.Missile ? "🚀" : "🛩")} «{Truncate(text.Trim(), 350)}»\n\n" +
                $"Джерело: {source} (неофіційні дані, можливі неточності).\n" +
                $"Твоя локація: {subscription.City}, {subscription.District}.\n" +
                "Слідкуй за офіційними повідомленнями; при оголошенні тривоги — негайно в укриття.\n\n" +
@@ -2402,9 +2603,8 @@ class Program
 
         foreach (DroneReport report in snapshot.Where(item => item.At >= threshold).OrderByDescending(item => item.At))
         {
-            string? scope = MatchDroneScope(report.Text, subscription);
-            if (scope is not null)
-                result.Add(new DroneMatch(report.At, scope, report.Text));
+            if (TryMatchThreat(report.Text, subscription, out string scope, out ThreatKind threat))
+                result.Add(new DroneMatch(report.At, scope, report.Text, threat));
         }
 
         return result;
@@ -2416,10 +2616,10 @@ class Program
         if (recent.Count == 0)
             return "";
 
-        string level = recent.Any(item => item.Scope == "місто") ? "🔴 червоний" : "🟡 жовтий";
+        string level = recent.Any(item => item.Threat == ThreatKind.Missile) ? "🔴 червоний — ракети/балістика" : "🟡 жовтий — дрони";
 
         StringBuilder builder = new();
-        builder.Append($"\n\n🛩 За останні 30 хв були повідомлення про БпЛА поруч ({level} рівень за БпЛА):");
+        builder.Append($"\n\n🛩 За останні 30 хв були повідомлення про загрози поруч ({level}):");
 
         foreach (DroneMatch item in recent.Take(2))
             builder.Append($"\n• {FormatClock(item.At)} — {Truncate(item.Text.Replace('\n', ' '), 120)}");
@@ -2479,13 +2679,13 @@ class Program
 
         if (recent.Count == 0)
         {
-            builder.AppendLine("🟢 За останню годину повідомлень про БпЛА поруч із твоєю локацією немає.");
+            builder.AppendLine("🟢 За останню годину повідомлень про ракети чи дрони поруч із твоєю локацією немає.");
         }
         else
         {
-            builder.AppendLine(recent.Any(item => item.Scope == "місто")
-                ? "🔴 ЧЕРВОНИЙ РІВЕНЬ — є повідомлення про БпЛА поруч із твоїм містом:"
-                : "🟡 ЖОВТИЙ РІВЕНЬ — є повідомлення про БпЛА в районі/області:");
+            builder.AppendLine(recent.Any(item => item.Threat == ThreatKind.Missile)
+                ? "🔴 ЧЕРВОНИЙ РІВЕНЬ — є повідомлення про ракети / балістику поруч:"
+                : "🟡 ЖОВТИЙ РІВЕНЬ — є повідомлення про дрони (ударні, реактивні, FPV) поруч:");
 
             foreach (DroneMatch item in recent.Take(5))
             {
@@ -2496,7 +2696,7 @@ class Program
                     _ => "область"
                 };
 
-                builder.AppendLine($"• {FormatClock(item.At)} [{label}] {Truncate(item.Text.Replace('\n', ' '), 160)}");
+                builder.AppendLine($"• {FormatClock(item.At)} {(item.Threat == ThreatKind.Missile ? "🔴" : "🟡")} [{label}] {Truncate(item.Text.Replace('\n', ' '), 160)}");
             }
         }
 
@@ -2697,7 +2897,7 @@ class Program
                 {
                     await Bot.SendMessage(
                         chatId,
-                        "Використання: /drone <текст>\nНаприклад: /drone Шахед курсом на Балаклію, Харківщина",
+                        "Використання: /drone <текст>\nЖовтий: /drone Шахед курсом на Балаклію, Харківщина\nЧервоний: /drone Балістика на Харківщину",
                         cancellationToken: ct);
                     break;
                 }
@@ -2706,7 +2906,7 @@ class Program
                 {
                     await Bot.SendMessage(
                         chatId,
-                        "Текст має містити слово «шахед», «БпЛА», «дрон» тощо, щоб бот зрозумів, що це повідомлення про БпЛА.",
+                        "Текст має містити слово про загрозу: «шахед», «БпЛА», «дрон», «ракета», «балістика» тощо.",
                         cancellationToken: ct);
                     break;
                 }
@@ -2822,7 +3022,7 @@ class Program
 
     private sealed record DroneReport(DateTimeOffset At, string Text, string Source);
 
-    private sealed record DroneMatch(DateTimeOffset At, string Scope, string Text);
+    private sealed record DroneMatch(DateTimeOffset At, string Scope, string Text, ThreatKind Threat);
 
     private sealed record AlertHistoryEntry(
         string StateKey,

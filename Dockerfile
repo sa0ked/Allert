@@ -17,9 +17,10 @@ ENV BOT_DATA_FILE=/data/bot-data.json
 
 # Переменные окружения (задаются в панели хостинга, НЕ в коде):
 #   BOT_TOKEN          - токен Telegram-бота (обязательно)
-#   ALERTS_API_TOKEN   - ключ API тревог
+#   UKRAINEALARM_API_KEY - ключ api.ukrainealarm.com (основне джерело тривог)
+#   ALERTS_API_TOKEN   - (необовʼязково) ключ alerts.in.ua, резервне джерело
 #   ADMIN_IDS          - (необязательно) Telegram ID админов через запятую
-#   DRONE_CHANNEL_IDS  - (необязательно) ID каналов-мониторингов (бот должен быть админом канала)
+#   DRONE_CHANNEL_IDS  - ID каналів-моніторингів (бот має бути адміном каналу) — звідси бере тип загрози: ракети/дрони
 #   UPDATES_URL        - (необязательно) ссылка на bot-update.json на GitHub
 
 ENTRYPOINT ["dotnet", "ConsoleApp.dll"]
